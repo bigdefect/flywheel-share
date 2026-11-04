@@ -1,0 +1,17 @@
+#!/bin/bash
+# Prints account usage from ~/.claude/usage-status.json (written by the status line).
+# session=on: Claude Code reports a five_hour window, so the 5-hour limit applies (e.g. an Ultra
+#   account not yet verified). session=off: no five_hour window is reported (verified Ultra).
+# Exit 2: file missing or older than 300s; treat usage as unknown.
+f="${USAGE_STATUS_FILE:-$HOME/.claude/usage-status.json}"
+[ -f "$f" ] || { echo "usage: unknown (no $f)"; exit 2; }
+now=$(date +%s)
+jq -r --argjson now "$now" '
+  def t: if . == null then "-" else (strftime("%Y-%m-%dT%H:%MZ")) end;
+  def p: if . == null then "-" else "\(. | floor)%" end;
+  (if .five_hour_pct == null then "off" else "on" end) as $session
+  | (.rate_limits // {} | to_entries | map(select(.key != "five_hour" and .key != "seven_day"))
+     | map(" \(.key)=\(.value.used_percentage|p)") | join("")) as $other
+  | "5h=\(.five_hour_pct|p) resets=\(.five_hour_resets_at|t) 7d=\(.seven_day_pct|p) resets=\(.seven_day_resets_at|t)\($other) session=\($session) age=\($now - .written_at)s"' "$f"
+age=$(( now - $(jq -r '.written_at' "$f") ))
+[ "$age" -le 300 ] || exit 2

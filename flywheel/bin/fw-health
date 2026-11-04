@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Recurring problems in the flywheel's own logs, for retro to turn into flywheel work items.
+
+Reads FW_STATE/watchdog.log and, per run dir, hooks.log and permission-denials.jsonl. Each problem line becomes a
+signature (source, kind, detail with ids and numbers masked); signatures seen at least --min times since --since
+are listed, most frequent first.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+
+WATCHDOG_PROBLEMS = {
+    "wake", "wake-aborted", "fork-warning", "fork-stopped", "watchdog-limit", "agents-failed", "hard-stop",
+    "hard-stop-aborted", "blocked-seen", "busy-stale", "caffeinate-failed", "caffeinate-unregistered",
+    "missing-script", "script-error", "script-failed", "launch-stale", "set-stopped-skipped", "weekly-stop",
+    "housekeep-error",
+}
+HOOK_PROBLEMS = (
+    ("permission-denied", re.compile(r"^permission_request denied tool=(\S+) input=(\S*)")),
+    ("fork-detected", re.compile(r"^session_start fork-detected")),
+    ("stop-cap-reached", re.compile(r"^allow condition=(\S+) cap-reached")),
+    ("stop-loop-guard", re.compile(r"^allow loop-guard")),
+)
+ID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{7,40}\b")
+NUM_RE = re.compile(r"\d+")
+MAX_DETAIL = 120
+SINCE_RE = re.compile(r"^(\d+)([dh])$")
+
+
+def mask(s: str) -> str:
+    s = ID_RE.sub("<id>", s)
+    s = NUM_RE.sub("N", s)
+    return " ".join(s.split())[:MAX_DETAIL]
+
+
+def split_line(line: str) -> tuple[dt.datetime | None, str]:
+    ts, _, rest = line.strip().partition(" ")
+    return fwlib.parse_iso(ts), rest
+
+
+def watchdog_signals(path: Path):
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        t, rest = split_line(line)
+        action, _, detail = rest.partition(" ")
+        if action == "housekeep":
+            m = re.search(r"rc=(\d+)", detail)
+            if not m or m.group(1) == "0":
+                continue
+            yield t, "watchdog", "housekeep-failed", mask(detail), None, line
+        elif action == "hard-stop" and detail.startswith("stop-complete"):
+            continue
+        elif action in WATCHDOG_PROBLEMS:
+            if action == "wake":
+                detail = detail.split(";", 1)[0]
+            yield t, "watchdog", action, mask(detail), None, line
+
+
+def hook_signals(run: Path):
+    try:
+        lines = (run / "hooks.log").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        t, rest = split_line(line)
+        for kind, rx in HOOK_PROBLEMS:
+            m = rx.match(rest)
+            if not m:
+                continue
+            if kind == "permission-denied":
+                detail = f"{m.group(1)} {m.group(2)}"
+            else:
+                detail = " ".join(m.groups())
+            yield t, "hooks", kind, mask(detail), run.name, line
+            break
+
+
+def collect(since: dt.datetime) -> list[dict]:
+    sigs: dict[tuple, dict] = {}
+    sources = [watchdog_signals(fwlib.state_dir() / "watchdog.log")]
+    runs = fwlib.runs_dir()
+    if runs.is_dir():
+        sources += [hook_signals(r) for r in sorted(runs.iterdir()) if r.is_dir()]
+    for src in sources:
+        for t, source, kind, detail, run, line in src:
+            if t is None or t < since:
+                continue
+            key = (source, kind, detail)
+            s = sigs.setdefault(key, {"source": source, "kind": kind, "detail": detail, "count": 0, "runs": set(),
+                                      "first": t, "last": t, "example": line.strip()[:300]})
+            s["count"] += 1
+            if run:
+                s["runs"].add(run)
+            s["first"], s["last"] = min(s["first"], t), max(s["last"], t)
+    out = []
+    for s in sigs.values():
+        s["runs"] = sorted(s["runs"])
+        s["first"], s["last"] = fwlib.iso(s["first"]), fwlib.iso(s["last"])
+        out.append(s)
+    out.sort(key=lambda s: (-s["count"], s["source"], s["kind"], s["detail"]))
+    return out
+
+
+def parse_since(v: str) -> dt.timedelta:
+    m = SINCE_RE.match(v)
+    if not m:
+        raise argparse.ArgumentTypeError(f"--since takes <N>d or <N>h, got {v!r}")
+    n = int(m.group(1))
+    return dt.timedelta(days=n) if m.group(2) == "d" else dt.timedelta(hours=n)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="fw-health", description=__doc__.splitlines()[0])
+    ap.add_argument("--since", type=parse_since, default=parse_since("14d"), help="window, e.g. 14d or 6h")
+    ap.add_argument("--min", type=int, default=2, help="minimum occurrences to list (default 2)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    t = fwlib.now()
+    rows = [s for s in collect(t - a.since) if s["count"] >= a.min]
+    if a.json:
+        fwlib.emit({"since": fwlib.iso(t - a.since), "min": a.min, "problems": rows})
+        return 0
+    if not rows:
+        print("no recurring problems")
+        return 0
+    for s in rows:
+        runs = f" runs={','.join(s['runs'])}" if s["runs"] else ""
+        print(f"{s['count']:>4}  {s['source']}/{s['kind']}: {s['detail']}  [{s['first']} .. {s['last']}]{runs}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Budget gate: usage + CPU load + disk + memory -> launch allowance (JSON on stdout)."""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+
+READINGS_KEEP_S = 30 * 60
+READINGS_WINDOW_S = 10 * 60
+FLOOR_NO_RESET_S = 7 * 86400
+KNOWN_KEYS = {"5h", "7d", "resets", "session", "age"}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _pct(v: str) -> float | None:
+    v = v.strip().rstrip("%")
+    if v in ("", "-"):
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def parse_usage(line: str) -> dict:
+    vals: dict[str, str] = {}
+    other: dict[str, float] = {}
+    seven_resets = None
+    prev = None
+    for tok in line.split():
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        if k == "resets" and prev == "7d" and fwlib.parse_iso(v) is not None:
+            seven_resets = v
+        prev = k
+        if k in KNOWN_KEYS:
+            vals.setdefault(k, v)
+        elif v.endswith("%"):
+            p = _pct(v)
+            if p is not None:
+                other[k] = p
+    session = {"on": True, "off": False}.get(vals.get("session", ""))
+    m = re.fullmatch(r"(\d+)s", vals.get("age", ""))
+    return {
+        "five_hour": _pct(vals.get("5h", "-")),
+        "seven_day": _pct(vals.get("7d", "-")),
+        "other": other,
+        "session": session,
+        "seven_day_resets_at": seven_resets,
+        "age_s": int(m.group(1)) if m else None,
+    }
+
+
+def read_usage() -> dict:
+    cmd = os.environ.get("FW_USAGE_CMD") or str(Path.home() / ".claude/bin/usage")
+    t = fwlib.now()
+    reading = {"ts": fwlib.iso(t), "data_ts": fwlib.iso(t), "five_hour": None, "seven_day": None, "other": {}, "session": None,
+               "seven_day_resets_at": None, "age_s": None, "stale": True}
+    try:
+        r = subprocess.run([cmd], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return reading
+    line = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+    reading.update(parse_usage(line))
+    if reading["age_s"] is not None:
+        reading["data_ts"] = fwlib.iso(t - _dt.timedelta(seconds=reading["age_s"]))
+    empty = reading["five_hour"] is None and reading["seven_day"] is None and not reading["other"]
+    reading["stale"] = r.returncode != 0 or empty
+    return reading
+
+
+def _rewrite_jsonl(path: Path, rows: list[dict]) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _max_weekly(r: dict) -> float | None:
+    vals = [v for v in [r.get("seven_day"), *(r.get("other") or {}).values()] if isinstance(v, (int, float))]
+    return max(vals) if vals else None
+
+
+def _data_time(r: dict) -> _dt.datetime | None:
+    return fwlib.parse_iso(r.get("data_ts")) or fwlib.parse_iso(r.get("ts"))
+
+
+def _floor_valid(r: dict, now: _dt.datetime) -> bool:
+    """A weekly reading stays a lower bound until its window resets (or for 7 days from its data time if the reset is unknown)."""
+    t = _data_time(r)
+    if t is None or _max_weekly(r) is None:
+        return False
+    reset = fwlib.parse_iso(r.get("seven_day_resets_at"))
+    if reset is not None:
+        return reset > now
+    return (now - t).total_seconds() <= FLOOR_NO_RESET_S
+
+
+def record_reading(reading: dict) -> tuple[list[dict], dict | None]:
+    """Append the reading, prune entries older than 30 min, keep the latest weekly floor in budget-floor.json.
+
+    Returns the kept rows and the floor reading (stale readings included), or None.
+    """
+    path = fwlib.state_dir() / "budget-readings.jsonl"
+    floor_path = fwlib.state_dir() / "budget-floor.json"
+    now = fwlib.now()
+    cutoff = now - _dt.timedelta(seconds=READINGS_KEEP_S)
+    with fwlib.locked(path):
+        rows = [r for r in fwlib.read_jsonl(path) if isinstance(r, dict)] + [reading]
+        kept = [r for r in rows if (t := fwlib.parse_iso(r.get("ts"))) is not None and t >= cutoff]
+        _rewrite_jsonl(path, kept)
+        old_floor = fwlib.read_json(floor_path)
+        cands = ([old_floor] if isinstance(old_floor, dict) else []) + rows
+        valid = [(_data_time(r), i, r) for i, r in enumerate(cands) if _floor_valid(r, now)]
+        floor = max(valid, key=lambda x: (x[0], x[1]))[2] if valid else None
+        if floor is None:
+            floor_path.unlink(missing_ok=True)
+        elif floor != old_floor:
+            fwlib.write_json_atomic(floor_path, floor)
+    return kept, floor
+
+
+def effective_usage(rows: list[dict], floor: dict | None = None) -> dict:
+    cutoff = fwlib.now() - _dt.timedelta(seconds=READINGS_WINDOW_S)
+    used = [r for r in rows
+            if not r.get("stale") and (t := fwlib.parse_iso(r.get("ts"))) is not None and t >= cutoff]
+    used.sort(key=lambda r: r.get("ts", ""))
+
+    def mx(vals):
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        return max(vals) if vals else None
+
+    five = mx(r.get("five_hour") for r in used)
+    seven = mx(r.get("seven_day") for r in used)
+    others = [v for r in used for v in (r.get("other") or {}).values()]
+    weekly = mx([seven, *others])
+    session = used[-1].get("session") if used else None
+    weekly_floor = None
+    if floor is not None:
+        weekly_floor = {"max_weekly": _max_weekly(floor), "ts": floor.get("ts"),
+                        "data_ts": floor.get("data_ts") or floor.get("ts"), "seven_day_resets_at": floor.get("seven_day_resets_at"), "stale": bool(floor.get("stale"))}
+    return {"five_hour": five, "seven_day": seven, "max_weekly": weekly, "session": session,
+            "stale": not used, "readings_used": len(used), "weekly_floor": weekly_floor}
+
+
+def _env_float(name: str) -> float | None:
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    return float(v)
+
+
+def read_load() -> dict:
+    env = os.environ.get("FW_TEST_LOADAVG")
+    if env is not None:
+        a, b, c = (float(x) for x in env.split(","))
+    else:
+        a, b, c = os.getloadavg()
+    cores = os.environ.get("FW_TEST_CORES")
+    return {"1m": a, "5m": b, "15m": c, "cores": int(cores) if cores is not None else (os.cpu_count() or 1)}
+
+
+def read_disk_free_gb(path: str | None) -> float:
+    env = _env_float("FW_TEST_DISK_FREE_GB")
+    if env is not None:
+        return env
+    return round(shutil.disk_usage(path or str(Path.home())).free / 1e9, 1)
+
+
+def read_mem_free_pct() -> float | None:
+    env = os.environ.get("FW_TEST_MEM_FREE_PCT")
+    if env is not None:
+        return None if env.lower() in ("", "none", "null") else float(env)
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=10).stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"page size of (\d+) bytes", vm)
+    if not m or total <= 0:
+        return None
+    page = int(m.group(1))
+    pages = 0
+    for key in ("Pages free", "Pages inactive", "Pages speculative"):
+        km = re.search(rf"^{key}:\s+(\d+)", vm, re.M)
+        if not km:
+            return None
+        pages += int(km.group(1))
+    return round(100.0 * pages * page / total, 1)
+
+
+def decide(usage: dict, load: dict, disk_free_gb: float, mem_free_pct: float | None, max_builders: int) -> dict:
+    reasons: list[str] = []
+    five, weekly, session = usage["five_hour"], usage["max_weekly"], usage["session"]
+    missing = usage["stale"] or weekly is None or (session and five is None)
+    floor = usage.get("weekly_floor") or {}
+    floor_weekly = floor.get("max_weekly")
+
+    if weekly is not None and weekly >= 95:
+        action, max_agents = "stop", 0
+        reasons.append(f"weekly usage {weekly:g}% >= 95%")
+    elif floor_weekly is not None and floor_weekly >= 95:
+        action, max_agents = "stop", 0
+        reasons.append(f"last known weekly usage {floor_weekly:g}% >= 95% (reading at {floor.get('ts')}, "
+                       f"resets {floor.get('seven_day_resets_at') or 'unknown'})")
+    elif session and five is not None and five > 85:
+        action, max_agents = "hold", 0
+        reasons.append(f"5h usage {five:g}% > 85% with session on")
+    elif missing:
+        action, max_agents = "cap", 2
+        reasons.append("usage stale or missing")
+    elif session and five is not None and 70 <= five <= 85:
+        action, max_agents = "cap", 2
+        reasons.append(f"5h usage {five:g}% in [70, 85] with session on")
+    else:
+        action, max_agents = "launch", None
+
+    cores = load["cores"]
+    builders = max_builders
+    if load["5m"] > 1.5 * cores:
+        builders = 0
+        reasons.append(f"5m load {load['5m']:g} > 1.5 x {cores} cores")
+    elif load["5m"] > 1.0 * cores:
+        builders = min(1, max_builders)
+        reasons.append(f"5m load {load['5m']:g} > {cores} cores")
+
+    if disk_free_gb < 10:
+        action, max_agents, builders = "stop", 0, 0
+        reasons.append(f"disk free {disk_free_gb:g} GB < 10 GB")
+    elif disk_free_gb < 25:
+        builders = 0
+        reasons.append(f"disk free {disk_free_gb:g} GB < 25 GB")
+
+    if mem_free_pct is not None and mem_free_pct < 10:
+        builders = min(builders, 1)
+        reasons.append(f"memory free {mem_free_pct:g}% < 10%")
+
+    if max_agents is not None:
+        builders = min(builders, max_agents)
+
+    return {"action": action, "max_agents": max_agents, "max_builders": builders, "reasons": reasons}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = Parser(prog="fw-budget", description=__doc__)
+    ap.add_argument("--max-builders", type=int, default=2)
+    ap.add_argument("--path", default=None, help="volume to measure free disk on (default $HOME)")
+    args = ap.parse_args(argv)
+    if args.max_builders < 0:
+        ap.error("--max-builders must be >= 0")
+
+    rows, floor = record_reading(read_usage())
+    usage = effective_usage(rows, floor)
+    load = read_load()
+    disk = read_disk_free_gb(args.path)
+    mem = read_mem_free_pct()
+    out = decide(usage, load, disk, mem, args.max_builders)
+    out.update({"usage": usage, "load": load, "disk_free_gb": disk, "mem_free_pct": mem})
+    fwlib.emit(out)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"fw-budget: internal error: {e!r}", file=sys.stderr)
+        sys.exit(2)

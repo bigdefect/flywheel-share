@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""Flywheel CLI: start, stop, status, note, grade, resume, doctor, install, uninstall."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+import fwrun  # noqa: E402
+
+RUN_FILES = ("BOARD.md", "INBOX.md", "DIGEST.md", "STATUS.md")
+
+
+class Usage(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def err(msg: str) -> None:
+    print(f"fw: {msg}", file=sys.stderr)
+
+
+def log_stderr(action: str, detail: str = "") -> None:
+    print(f"fw: {action} {detail}".rstrip(), file=sys.stderr)
+
+
+def require_active() -> dict:
+    a = fwlib.active()
+    if a is None:
+        raise Usage("no active run")
+    return a
+
+
+def parse_deadline(s: str | None, t: dt.datetime) -> dt.datetime | None:
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+)([mhd])", s.strip())
+    if m:
+        n = int(m.group(1))
+        return t + {"m": dt.timedelta(minutes=n), "h": dt.timedelta(hours=n), "d": dt.timedelta(days=n)}[m.group(2)]
+    d = fwlib.parse_iso(s)
+    if d is None:
+        raise Usage(f"bad --deadline {s!r}: use a duration like 12h, 90m, 2d or an ISO time")
+    return d
+
+
+def grace_min(profile: dict) -> int:
+    try:
+        return int(profile.get("deadline_grace_min", 120))
+    except (TypeError, ValueError):
+        return 120
+
+
+def launch_cwd(profile: dict) -> str:
+    return str(Path(profile.get("launch_cwd") or profile["repo"]).expanduser())
+
+
+def render_template(name: str, subs: dict[str, str]) -> str | None:
+    p = fwlib.FW_HOME / "skill" / "templates" / name
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for k, v in subs.items():
+        text = text.replace("{" + k + "}", v)
+    return text
+
+
+def hook_cmd(script: str, run_id: str) -> str:
+    return " ".join(["env", "FW_STATE=" + shlex.quote(str(fwlib.FW_STATE)), "FW_HOME=" + shlex.quote(str(fwlib.FW_HOME))]
+                    + [shlex.quote(x) for x in (sys.executable, str(fwlib.FW_HOME / "hooks" / script), "--run", run_id)])
+
+
+def session_settings(run_id: str) -> dict:
+    return {
+        "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": hook_cmd("stop.py", run_id), "timeout": 30}]}],
+            "SessionStart": [{"hooks": [{"type": "command", "command": hook_cmd("session_start.py", run_id),
+                                         "timeout": 30}]}],
+            "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command",
+                                                              "command": hook_cmd("permission_request.py", run_id),
+                                                              "timeout": 15, "onFailure": "block"}]}],
+        },
+        "statusLine": {"type": "command", "command": hook_cmd("statusline.py", run_id), "refreshInterval": 30},
+    }
+
+
+def refuse_start() -> None:
+    if fwlib.kill_path().exists():
+        raise Usage(f"kill switch {fwlib.kill_path()} exists; remove it (rm {shlex.quote(str(fwlib.kill_path()))}) to start")
+    cur = fwlib.active()
+    if cur is not None:
+        raise Usage(f"run {cur.get('run_id')} is active (state {cur.get('state')}); stop it first with `fw stop`")
+    raw = fwrun.read_active_raw()
+    if raw is not None and raw.get("state") == "starting":
+        raise Usage(f"run {raw.get('run_id')} is still starting; if its `fw start` died, the watchdog stops it "
+                    f"{fwrun.LAUNCH_STALE_S // 60} min after it started")
+
+
+def cmd_start(a) -> int:
+    refuse_start()
+    try:
+        prof = fwlib.load_profile(a.profile)
+    except (OSError, ValueError, KeyError) as e:
+        raise Usage(f"cannot load profile {a.profile!r}: {e}")
+    name = prof.get("name", a.profile)
+    cwd = launch_cwd(prof)
+    if not fwrun.is_trusted(cwd):
+        raise Usage(f"launch cwd {cwd} is not trusted by Claude Code; run `claude` there once and accept the trust dialog")
+    t = fwrun.now()
+    deadline = parse_deadline(a.deadline, t)
+    run_id = f"{name}-{t.astimezone(dt.timezone.utc):%Y%m%d-%H%M%S}"
+    rd = fwlib.run_dir(run_id)
+    with fwlib.locked(fwlib.active_path()):
+        refuse_start()
+        if rd.exists():
+            raise Usage(f"run dir {rd} already exists")
+        sid = write_run(a, prof, name, cwd, run_id, rd, t, deadline, "running" if a.no_launch else "starting")
+        r = fwrun.sibling("fw-registry", ["add", "--kind", "run-dir", "--path", str(rd), "--run", run_id,
+                                          "--purpose", "run"], timeout=60, log=log_stderr)
+        if r is not None and r.returncode != 0:
+            err(f"fw-registry add run-dir failed: {fwrun.tail(r.stderr)}")
+        if not a.no_launch:
+            rc = launch(a, prof, cwd, run_id, rd, sid, deadline)
+            if rc:
+                return rc
+        out = fwrun.read_active_raw()
+    fwlib.emit(out)
+    return 0
+
+
+def write_run(a, prof: dict, name: str, cwd: str, run_id: str, rd: Path, t: dt.datetime,
+              deadline: dt.datetime | None, state: str) -> str:
+    rd.mkdir(parents=True)
+    dl = fwlib.iso(deadline) if deadline else None
+    subs = {"goal": a.goal, "deadline": dl or "none", "run_id": run_id, "repo": prof["repo"]}
+    mission = render_template("MISSION.md", subs)
+    if mission is None:
+        mission = f"# Mission: {run_id}\n\nGoal (verbatim):\n\n{a.goal}\n\nRepo: {prof['repo']}\nDeadline: {dl or 'none'}\n"
+    (rd / "MISSION.md").write_text(mission, encoding="utf-8")
+    for f in RUN_FILES:
+        (rd / f).write_text(render_template(f, subs) or "", encoding="utf-8")
+    fwlib.write_json_atomic(rd / "settings.json", session_settings(run_id))
+    sid = str(uuid.uuid4())
+    active = {
+        "run_id": run_id, "profile": name, "repo": prof["repo"], "cwd": cwd, "session_id": sid, "bg_id": None,
+        "host": "claude-bg", "started": fwlib.iso(t), "deadline": dl, "state": state, "wakes": [],
+        "model": a.model, "effort": a.effort,
+    }
+    fwlib.write_json_atomic(fwlib.active_path(), active)
+    return sid
+
+
+def launch(a, prof: dict, cwd: str, run_id: str, rd: Path, sid: str, deadline: dt.datetime | None) -> int:
+    """Caller holds fwlib.locked(fwlib.active_path()) and has written the run with state `starting`."""
+    prompt = (f"Start flywheel run {run_id}: invoke the flywheel skill (`/flywheel`) and run the loop. "
+              f"Mission: {rd / 'MISSION.md'}.")
+    cmd = [fwrun.claude_bin(), "--bg", "--session-id", sid, "--settings", str(rd / "settings.json"), "--model",
+           a.model, "--effort", a.effort, "--permission-mode", "bypassPermissions", "-n", f"flywheel-{run_id}", prompt]
+    return run_launch(cmd, prof, cwd, run_id, rd, sid, deadline)
+
+
+def run_launch(cmd: list[str], prof: dict, cwd: str, run_id: str, rd: Path, sid: str, deadline: dt.datetime | None,
+               restore=None) -> int:
+    """Run a `claude ... --bg` launch and record the session; on failure stop any leftover and call `restore`."""
+    out, rc = "", None
+    try:
+        p = fwlib.run(cmd, cwd=cwd, timeout=60)
+        out, rc = (p.stdout or "") + (p.stderr or ""), p.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out = str(e)
+    m = fwrun.BG_RE.search(out)
+    if rc != 0 or not m:
+        rows = fwrun.agents(timeout=30)
+        row = fwrun.find_row(rows or [], sid) or launched_row(rows or [], m.group(1) if m else None, run_id)
+        bg = (row or {}).get("id") or (m.group(1) if m else None)
+        if bg:
+            r = fwrun.claude_stop(bg)
+            err(f"claude stop {bg} after failed launch: rc={None if r is None else r.returncode}")
+        elif rows is None:
+            err(f"claude agents failed; cannot check for a leftover session {sid}")
+        if restore is not None:
+            restore()
+        fwrun.write_stop_reason(rd, f"launch-failed: {fwrun.tail(out)}", overwrite=True)
+        fwrun.update_active_unlocked(run_id, state="stopped")
+        err(f"launch failed (rc={rc}): {fwrun.tail(out)}")
+        return 2
+    bg = m.group(1)
+    real = resolve_session_id(rd, run_id, bg)
+    if real and real != sid:
+        err(f"session id is {real} (claude --bg assigns its own); recording it")
+    fwrun.update_active_unlocked(run_id, bg_id=bg, session_id=real or sid)
+    fwrun.start_caffeinate(run_id, deadline, grace_min(prof), log_stderr)
+    fwrun.update_active_unlocked(run_id, state="running")
+    return 0
+
+
+ADOPT_POLL_S = float(os.environ.get("FW_TEST_ADOPT_POLL_S") or 15)
+ADOPT_STOP_WAIT_S = float(os.environ.get("FW_TEST_ADOPT_STOP_WAIT_S") or 30)
+
+
+def adopt_key(a) -> str:
+    if a.self:
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if not sid:
+            raise Usage("--self needs CLAUDE_CODE_SESSION_ID (set inside a Claude Code session)")
+        return sid
+    if not a.session:
+        raise Usage("name the session to adopt (background id, name or session id), or pass --self")
+    return a.session
+
+
+def adoptable_row(key: str, wait_s: float) -> dict:
+    """The one background session matching `key`, once it is not busy; waits up to `wait_s`."""
+    end = time.monotonic() + wait_s
+    while True:
+        rows = fwrun.agents(timeout=30)
+        if rows is None:
+            raise Usage("claude agents failed; cannot find the session")
+        hits = [r for r in rows if key in (r.get("id"), r.get("name"), r.get("sessionId"))]
+        if not hits:
+            raise Usage(f"no background session matches {key!r} (see `claude agents`); only background sessions "
+                        "can be adopted")
+        if len(hits) > 1:
+            raise Usage(f"{key!r} matches {len(hits)} sessions ({', '.join(str(h.get('id')) for h in hits)}); "
+                        "use the background id")
+        row = hits[0]
+        if (row.get("name") or "").startswith("flywheel-"):
+            raise Usage(f"session {row.get('id')} is already a flywheel orchestrator")
+        if not row.get("sessionId"):
+            raise Usage(f"session {row.get('id')} has no session id in `claude agents`")
+        if row.get("status") != "busy":
+            return row
+        if time.monotonic() >= end:
+            raise Usage(f"session {row.get('id')} is busy; retry when it is idle, or pass --wait-idle MIN")
+        time.sleep(ADOPT_POLL_S)
+
+
+def wait_stopped(bg: str) -> bool:
+    end = time.monotonic() + ADOPT_STOP_WAIT_S
+    while True:
+        rows = fwrun.agents(timeout=30)
+        row = next((r for r in rows or [] if r.get("id") == bg), None)
+        if rows is not None and (row is None or row.get("status") is None):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(min(1.0, ADOPT_POLL_S))
+
+
+def detach_adopt(a) -> int:
+    log = fwlib.state_dir() / f"adopt-{int(time.time())}.log"
+    argv = [sys.executable, str(Path(__file__).resolve()), "adopt", "--profile", a.profile, "--model", a.model,
+            "--effort", a.effort, "--wait-idle", str(a.wait_idle if a.wait_idle is not None else 30)]
+    if a.goal:
+        argv += ["--goal", a.goal]
+    if a.deadline:
+        argv += ["--deadline", a.deadline]
+    argv.append(adopt_key(a))
+    with open(log, "ab") as fh:
+        p = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+                             env=os.environ.copy())
+    fwlib.emit({"detached": p.pid, "log": str(log), "argv": argv[2:]})
+    return 0
+
+
+def cmd_adopt(a) -> int:
+    if a.self and not a.detach:
+        raise Usage("--self needs --detach: the session cannot be stopped while it waits on this command")
+    if a.detach:
+        refuse_start()
+        adopt_key(a)
+        return detach_adopt(a)
+    refuse_start()
+    try:
+        prof = fwlib.load_profile(a.profile)
+    except (OSError, ValueError, KeyError) as e:
+        raise Usage(f"cannot load profile {a.profile!r}: {e}")
+    name = prof.get("name", a.profile)
+    t = fwrun.now()
+    deadline = parse_deadline(a.deadline, t)
+    row = adoptable_row(adopt_key(a), (a.wait_idle or 0) * 60)
+    orig_sid, orig_bg = row["sessionId"], row.get("id")
+    label = row.get("name") or orig_bg
+    cwd = str(Path(row.get("cwd") or launch_cwd(prof)).expanduser())
+    if not fwrun.is_trusted(cwd):
+        raise Usage(f"session cwd {cwd} is not trusted by Claude Code")
+    a.goal = a.goal or (f"Continue the goal and work of adopted session {label} unattended, as stated in its "
+                        "conversation.")
+    t = fwrun.now()
+    run_id = f"{name}-{t.astimezone(dt.timezone.utc):%Y%m%d-%H%M%S}"
+    rd = fwlib.run_dir(run_id)
+    with fwlib.locked(fwlib.active_path()):
+        refuse_start()
+        if rd.exists():
+            raise Usage(f"run dir {rd} already exists")
+        sid = write_run(a, prof, name, cwd, run_id, rd, t, deadline, "starting")
+        fwrun.update_active_unlocked(run_id, adopted_from=orig_sid, adopted_name=label, adopted_bg=orig_bg)
+        r = fwrun.sibling("fw-registry", ["add", "--kind", "run-dir", "--path", str(rd), "--run", run_id,
+                                          "--purpose", "run"], timeout=60, log=log_stderr)
+        if r is not None and r.returncode != 0:
+            err(f"fw-registry add run-dir failed: {fwrun.tail(r.stderr)}")
+        if row.get("status") is not None:
+            r = fwrun.claude_stop(orig_bg)
+            if r is None or r.returncode != 0 or not wait_stopped(orig_bg):
+                fwrun.write_stop_reason(rd, f"adopt-failed: could not stop {orig_bg}", overwrite=True)
+                fwrun.update_active_unlocked(run_id, state="stopped")
+                err(f"could not stop session {orig_bg}; nothing adopted")
+                return 2
+        # Resuming a stopped session with flags starts a copy (new id) that carries the full conversation and
+        # runs this run's hooks; the original stays stopped.
+        prompt = (f"Flywheel run {run_id} adopts this session as its orchestrator. Invoke the flywheel skill "
+                  f"(`/flywheel`) and follow its 'Adopted runs' section. Mission: {rd / 'MISSION.md'}.")
+        cmd = [fwrun.claude_bin(), "--resume", orig_sid, "--bg", "--settings", str(rd / "settings.json"),
+               "--model", a.model, "--effort", a.effort, "--permission-mode", "bypassPermissions",
+               "-n", f"flywheel-{run_id}", prompt]
+
+        def restore() -> None:
+            try:
+                fwlib.run([fwrun.claude_bin(), "--resume", orig_sid, "--bg",
+                           "fw adopt failed; nothing changed for you. Continue where you left off."], cwd=cwd, timeout=60)
+                err(f"woke the original session {orig_bg} again")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                err(f"could not wake the original session {orig_bg}: {e}; run `claude --resume {orig_sid} --bg`")
+
+        rc = run_launch(cmd, prof, cwd, run_id, rd, sid, deadline, restore if row.get("status") is not None else None)
+        if rc:
+            return rc
+        out = fwrun.read_active_raw()
+    fwlib.emit(out)
+    return 0
+
+
+def cmd_whoami(a) -> int:
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    act = fwrun.read_active_raw()
+    live = isinstance(act, dict) and act.get("state") in ("starting", "running", "stopping")
+    run = act.get("run_id") if live else None
+    role = "orchestrator" if live and sid and act.get("session_id") == sid else "front-door"
+    fwlib.emit({"role": role, "session_id": sid, "active_run": run})
+    return 0
+
+
+def launched_row(rows: list[dict], bg: str | None, run_id: str) -> dict | None:
+    for row in rows:
+        if (bg and row.get("id") == bg) or row.get("name") == f"flywheel-{run_id}":
+            return row
+    return None
+
+
+def resolve_session_id(rd: Path, run_id: str, bg: str) -> str | None:
+    """`claude --bg` ignores --session-id (verified 2.1.317), so read the real id back.
+
+    Sources in order: the background-session row for the parsed id, then the id the
+    SessionStart hook claimed during launch.
+    """
+    for _ in range(5):
+        row = launched_row(fwrun.agents(timeout=30) or [], bg, run_id)
+        if row and row.get("sessionId"):
+            return row["sessionId"]
+        claimed = (rd / "session_id.claimed")
+        if claimed.exists():
+            v = claimed.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        time.sleep(1)
+    return None
+
+
+def cmd_stop(a) -> int:
+    act = require_active()
+    rd = fwlib.run_dir(act["run_id"])
+    if not a.now:
+        with fwlib.locked(fwlib.active_path()):
+            cur = fwlib.active()
+            if cur is None or cur.get("run_id") != act["run_id"]:
+                raise Usage("the active run changed; re-run `fw stop`")
+            with open(rd / "INBOX.md", "a", encoding="utf-8") as fh:
+                fh.write(f"- {fwlib.iso(fwrun.now())} stop\n")
+            fwrun.update_active_unlocked(act["run_id"], state="stopping")
+        print(f"run {act['run_id']}: stop requested; the orchestrator will run its stop procedure")
+        return 0
+    rows = fwrun.agents(timeout=30)
+    with fwlib.locked(fwlib.active_path()):
+        cur = fwlib.active()
+        if cur is None or cur.get("run_id") != act["run_id"]:
+            raise Usage("the active run changed; re-run `fw stop --now`")
+        row = fwrun.find_row(rows or [], cur.get("session_id"))
+        bg = fwrun.bg_id_of(cur, row)
+        if bg:
+            r = fwrun.claude_stop(bg)
+            print(f"claude stop {bg}: rc={None if r is None else r.returncode}")
+        fwrun.write_stop_reason(rd, a.reason or "user-stop-now", overwrite=True)
+        fwrun.update_active_unlocked(act["run_id"], state="stopped")
+    fwrun.mark_owner_done(lambda k, d="": print(f"{k} {d}".rstrip()), run_id=act["run_id"])
+    r = fwrun.sibling("fw-housekeep", ["--quick"] + (["--profile", act["profile"]] if act.get("profile") else []),
+                      timeout=900, log=log_stderr)
+    if r is not None:
+        print(f"fw-housekeep --quick rc={r.returncode}")
+    print(f"run {act['run_id']}: stopped")
+    return 0
+
+
+def last_lines(p: Path, n: int) -> list[str]:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def cmd_status(a) -> int:
+    act = fwrun.read_active_raw()
+    out: dict = {"active": act, "session": None, "heartbeat_age_s": None, "waiting": None, "budget": None,
+                 "board": None, "digest_tail": [], "watchdog_tail": last_lines(fwlib.state_dir() / "watchdog.log", 5)}
+    if act and act.get("run_id"):
+        rd = fwlib.run_dir(act["run_id"])
+        rows = fwrun.agents(timeout=30)
+        row = fwrun.find_row(rows or [], act.get("session_id"))
+        out["session"] = None if rows is None else (
+            {"status": row.get("status"), "state": row.get("state"), "id": row.get("id")} if row else "missing")
+        out["heartbeat_age_s"] = fwrun.mtime_age(rd / "heartbeat")
+        out["waiting"] = fwlib.read_json(rd / "waiting.json")
+        board = last_lines(rd / "BOARD.md", 100000)
+        out["board"] = board_counts(board)
+        out["digest_tail"] = last_lines(rd / "DIGEST.md", 5)
+        out["stop_reason"] = (last_lines(rd / "stop-reason", 1) or [None])[0]
+    out["budget"] = fwrun.sibling_json("fw-budget", [], timeout=120)
+    if a.json:
+        fwlib.emit(out)
+        return 0
+    if not act:
+        print("no active run")
+    else:
+        print(f"run       {act.get('run_id')}  state={act.get('state')}  profile={act.get('profile')}")
+        print(f"repo      {act.get('repo')}  cwd={act.get('cwd')}")
+        print(f"session   {act.get('session_id')}  bg={act.get('bg_id')}  row={out['session']}")
+        print(f"started   {act.get('started')}  deadline={act.get('deadline')}  wakes={len(act.get('wakes') or [])}")
+        hb = out["heartbeat_age_s"]
+        print(f"heartbeat {'none' if hb is None else f'{int(hb)}s ago'}")
+        print(f"waiting   {out['waiting']}")
+        if out.get("stop_reason"):
+            print(f"stopped   {out['stop_reason']}")
+        if out["board"]:
+            bc = out["board"]
+            print(f"board     merged={bc['merged']} dropped={bc['dropped']} open={bc['open']} candidates={bc['candidates']}")
+        for line in out["digest_tail"]:
+            print(f"digest    {line}")
+    b = out["budget"]
+    if isinstance(b, dict):
+        print(f"budget    action={b.get('action')} max_agents={b.get('max_agents')} "
+              f"max_weekly={(b.get('usage') or {}).get('max_weekly')} reasons={b.get('reasons')}")
+    else:
+        print("budget    unavailable")
+    for line in out["watchdog_tail"]:
+        print(f"watchdog  {line}")
+    return 0
+
+
+def cmd_note(a) -> int:
+    act = require_active()
+    text = " ".join(a.text).strip()
+    if not text:
+        raise Usage("empty note")
+    with open(fwlib.run_dir(act["run_id"]) / "INBOX.md", "a", encoding="utf-8") as fh:
+        fh.write(f"- {fwlib.iso(fwrun.now())} {text}\n")
+    print(f"noted in {act['run_id']}/INBOX.md")
+    return 0
+
+
+def cmd_grade(a) -> int:
+    prof = a.profile
+    if not prof:
+        act = fwlib.active()
+        if act is None or not act.get("profile"):
+            raise Usage("no active run; pass --profile")
+        prof = act["profile"]
+    payload = {"grade": a.grade, "note": " ".join(a.note), "decider": "user"}
+    r = fwrun.sibling("fw-ledger", ["event", "--repo", prof, "--id", a.ledger_id, "--kind", "grade",
+                                    "--json", json.dumps(payload)], timeout=60, log=log_stderr)
+    if r is None:
+        return 2
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    return r.returncode
+
+
+def board_counts(lines: list[str]) -> dict:
+    """WP rows of templates/BOARD.md (`| WP-<n> | title | class | risk | state | ...`) by state, plus unchosen candidates."""
+    c = {"merged": 0, "dropped": 0, "open": 0, "candidates": 0}
+    for x in lines:
+        cells = [y.strip() for y in x.split("|")]
+        if len(cells) > 5 and re.fullmatch(r"(WP-)?\d+", cells[1]):
+            st = cells[5].lower()
+            c["merged" if st.startswith("merged") else "dropped" if st.startswith("dropped") else "open"] += 1
+        elif x.lstrip().startswith("- [ ]"):
+            c["candidates"] += 1
+    return c
+
+
+def cmd_resume(a) -> int:
+    act = require_active()
+    rd = fwlib.run_dir(act["run_id"])
+    if fwlib.kill_path().exists():
+        raise Usage(f"kill switch {fwlib.kill_path()} exists; not waking")
+    if (rd / "stop-reason").exists():
+        raise Usage(f"run ended ({(last_lines(rd / 'stop-reason', 1) or [''])[0]}); not waking")
+    rows = fwrun.agents(timeout=30)
+    if rows is None:
+        err("claude agents failed; session state unknown")
+        return 2
+    row = fwrun.find_row(rows, act.get("session_id"))
+    if row is not None and row.get("status") == "busy" and row.get("state") not in ("failed", "stopped"):
+        print(f"session {act.get('session_id')} is busy; not waking")
+        return 1
+    res = fwrun.wake(act, row, "resumed by fw resume", lambda k, d="": print(f"{k} {d}".rstrip()))
+    fwlib.emit(res)
+    return 0 if res.get("woke") else 2
+
+
+def check(name: str, ok: bool, detail: str) -> dict:
+    return {"name": name, "ok": bool(ok), "detail": detail}
+
+
+def profiles() -> list[tuple[str, dict | None, str]]:
+    out = []
+    for p in sorted((fwlib.FW_HOME / "profiles").glob("*.md")):
+        try:
+            out.append((p.stem, fwlib.load_profile(p.stem), ""))
+        except Exception as e:  # noqa: BLE001
+            out.append((p.stem, None, f"{type(e).__name__}: {e}"))
+    return out
+
+
+def probe(cwd: str) -> dict:
+    pd = fwlib.state_dir() / "probe" / f"probe-{int(time.time())}"
+    pd.mkdir(parents=True, exist_ok=True)
+    marker = pd / "marker"
+    settings = pd / "settings.json"
+    fwlib.write_json_atomic(settings, {"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": f"touch {shlex.quote(str(marker))}", "timeout": 10}]}]}})
+    claude = fwrun.claude_bin()
+    try:
+        r = fwlib.run([claude, "--bg", "--session-id", str(uuid.uuid4()), "--settings", str(settings), "--model", "haiku",
+                       "-n", "flywheel-probe", "Reply OK."], cwd=cwd, timeout=120)
+        out = (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return check("probe", False, f"launch failed: {e}")
+    m = fwrun.BG_RE.search(out)
+    if not m:
+        return check("probe", False, f"no background id: {fwrun.tail(out)}")
+    bg = m.group(1)
+    end = time.monotonic() + 90
+    while time.monotonic() < end and not marker.exists():
+        time.sleep(1)
+    seen = marker.exists()
+    for sub in ("stop", "rm"):
+        try:
+            fwlib.run([claude, sub, bg], timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    shutil.rmtree(pd, ignore_errors=True)
+    return check("probe", seen, f"session {bg}: Stop hook marker {'appeared' if seen else 'missing after 90 s'}")
+
+
+def cmd_doctor(a) -> int:
+    checks = []
+    v = sys.version_info
+    checks.append(check("python", v >= (3, 11), f"{v.major}.{v.minor}.{v.micro} at {sys.executable}"))
+    claude = fwrun.claude_bin()
+    if Path(claude).exists() or shutil.which(claude):
+        try:
+            r = fwlib.run([claude, "--version"], timeout=30)
+            checks.append(check("claude", r.returncode == 0, f"{claude}: {fwrun.tail(r.stdout or r.stderr, 100)}"))
+        except (OSError, subprocess.TimeoutExpired) as e:
+            checks.append(check("claude", False, f"{claude}: {e}"))
+    else:
+        checks.append(check("claude", False, f"not found ({claude})"))
+    link = fwrun.skills_dir() / "flywheel"
+    target = (fwlib.FW_HOME / "skill").resolve()
+    if link.is_symlink():
+        checks.append(check("skill-symlink", link.resolve() == target, f"{link} -> {os.readlink(link)}"))
+    else:
+        checks.append(check("skill-symlink", False, f"{link} {'is not a symlink' if link.exists() else 'missing'}"))
+    try:
+        r = fwlib.run([fwrun.launchctl_bin(), "print", f"gui/{os.getuid()}/{fwrun.LABEL}"], timeout=30)
+        checks.append(check("launchd", r.returncode == 0, f"{fwrun.LABEL} {'loaded' if r.returncode == 0 else 'not loaded'}"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        checks.append(check("launchd", False, str(e)))
+    profs = profiles()
+    if not profs:
+        checks.append(check("profiles", False, f"no profiles in {fwlib.FW_HOME / 'profiles'}"))
+    for name, prof, e in profs:
+        checks.append(check(f"profile:{name}", prof is not None, e or "parses"))
+        if prof is not None:
+            try:
+                cwd = launch_cwd(prof)
+                checks.append(check(f"trusted:{name}", fwrun.is_trusted(cwd), cwd))
+            except KeyError as ke:
+                checks.append(check(f"trusted:{name}", False, f"missing {ke}"))
+    if not a.fast:
+        try:
+            r = fwlib.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=fwlib.FW_HOME, timeout=600)
+            last = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+            checks.append(check("tests", r.returncode == 0, last[0]))
+        except (OSError, subprocess.TimeoutExpired) as e:
+            checks.append(check("tests", False, str(e)))
+    try:
+        r = subprocess.run([fwrun.usage_cmd()], capture_output=True, text=True, timeout=30)
+        checks.append(check("usage", r.returncode == 0, fwrun.tail(r.stdout, 120) or f"rc={r.returncode}"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        checks.append(check("usage", False, str(e)))
+    free = shutil.disk_usage(Path.home()).free / 1e9
+    checks.append(check("disk", free >= 25, f"{free:.0f} GB free"))
+    if a.probe:
+        good = [p for _, p, _ in profs if p is not None]
+        if not good:
+            checks.append(check("probe", False, "no parseable profile for a launch cwd"))
+        else:
+            checks.append(probe(launch_cwd(good[0])))
+    ok = all(c["ok"] for c in checks)
+    if a.json:
+        fwlib.emit({"ok": ok, "checks": checks})
+    else:
+        for c in checks:
+            print(f"{'ok  ' if c['ok'] else 'FAIL'} {c['name']}: {c['detail']}")
+    return 0 if ok else 1
+
+
+def path_env() -> str:
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and os.path.isdir(d)]
+    claude = shutil.which(fwrun.claude_bin())
+    if claude:
+        dirs.append(os.path.dirname(os.path.abspath(claude)))
+    dirs += [str(Path(sys.executable).parent), "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    return ":".join(dict.fromkeys(dirs))
+
+
+def render_plist() -> str:
+    text = (fwlib.FW_HOME / "launchd" / f"{fwrun.LABEL}.plist.in").read_text(encoding="utf-8")
+    subs = {"@PYTHON@": sys.executable, "@FW_HOME@": str(fwlib.FW_HOME), "@FW_STATE@": str(fwlib.FW_STATE),
+            "@PATH@": path_env(), "@HOME@": str(Path.home())}
+    for k, v in subs.items():
+        text = text.replace(k, escape(v))
+    return text
+
+
+def launchctl(*args: str) -> subprocess.CompletedProcess:
+    return fwlib.run([fwrun.launchctl_bin(), *args], timeout=60)
+
+
+def cmd_install(a) -> int:
+    link = fwrun.skills_dir() / "flywheel"
+    target = fwlib.FW_HOME / "skill"
+    pre = "would " if a.dry_run else ""
+    if link.is_symlink():
+        if link.resolve() == target.resolve():
+            print(f"skill symlink {link} -> {os.readlink(link)} already in place")
+        elif not a.force:
+            raise Usage(f"{link} points to {os.readlink(link)}; pass --force to replace it")
+        else:
+            print(f"{pre}replace symlink {link} -> {target}")
+            if not a.dry_run:
+                link.unlink()
+                link.symlink_to(target)
+    elif link.exists():
+        raise Usage(f"{link} exists and is not a symlink; move it away first")
+    else:
+        print(f"{pre}create symlink {link} -> {target}")
+        if not a.dry_run:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target)
+    plist = fwrun.launch_agents_dir() / f"{fwrun.LABEL}.plist"
+    text = render_plist()
+    print(f"{pre}write {plist}")
+    domain = f"gui/{os.getuid()}"
+    print(f"{pre}run launchctl bootout {domain}/{fwrun.LABEL}")
+    print(f"{pre}run launchctl bootstrap {domain} {plist}")
+    if a.dry_run:
+        return 0
+    fwlib.state_dir()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    tmp = plist.with_name(f".{plist.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, plist)
+    launchctl("bootout", f"{domain}/{fwrun.LABEL}")
+    r = launchctl("bootstrap", domain, str(plist))
+    if r.returncode != 0:
+        err(f"launchctl bootstrap failed rc={r.returncode}: {fwrun.tail(r.stderr or r.stdout)}")
+        return 2
+    print("installed")
+    return 0
+
+
+def cmd_uninstall(a) -> int:
+    pre = "would " if a.dry_run else ""
+    domain = f"gui/{os.getuid()}"
+    print(f"{pre}run launchctl bootout {domain}/{fwrun.LABEL}")
+    if not a.dry_run:
+        launchctl("bootout", f"{domain}/{fwrun.LABEL}")
+    plist = fwrun.launch_agents_dir() / f"{fwrun.LABEL}.plist"
+    if plist.exists():
+        print(f"{pre}delete {plist}")
+        if not a.dry_run:
+            plist.unlink()
+    link = fwrun.skills_dir() / "flywheel"
+    if link.is_symlink():
+        if link.resolve() == (fwlib.FW_HOME / "skill").resolve():
+            print(f"{pre}remove symlink {link}")
+            if not a.dry_run:
+                link.unlink()
+        else:
+            print(f"leave {link}: points to {os.readlink(link)}, not {fwlib.FW_HOME / 'skill'}")
+    return 0
+
+
+def main() -> int:
+    ap = Parser(prog="fw")
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+    p = sub.add_parser("start")
+    p.add_argument("--profile", required=True)
+    p.add_argument("--goal", required=True)
+    p.add_argument("--deadline")
+    p.add_argument("--model", default="opus")
+    p.add_argument("--effort", default="high")
+    p.add_argument("--no-launch", action="store_true")
+    p.set_defaults(fn=cmd_start)
+    p = sub.add_parser("adopt", help="turn an existing background session into the orchestrator of a new run")
+    p.add_argument("session", nargs="?", help="background id, name or session id")
+    p.add_argument("--self", action="store_true", help="adopt the session running this command (with --detach)")
+    p.add_argument("--profile", required=True)
+    p.add_argument("--goal")
+    p.add_argument("--deadline")
+    p.add_argument("--model", default="opus")
+    p.add_argument("--effort", default="high")
+    p.add_argument("--wait-idle", type=float, metavar="MIN", help="wait up to MIN minutes for the session to go idle")
+    p.add_argument("--detach", action="store_true", help="run in the background (needed to adopt your own session)")
+    p.set_defaults(fn=cmd_adopt)
+    p = sub.add_parser("whoami", help="is this Claude session the active run's orchestrator?")
+    p.set_defaults(fn=cmd_whoami)
+    p = sub.add_parser("stop")
+    p.add_argument("--now", action="store_true")
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_stop)
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("note")
+    p.add_argument("text", nargs="+")
+    p.set_defaults(fn=cmd_note)
+    p = sub.add_parser("grade")
+    p.add_argument("ledger_id")
+    p.add_argument("grade", choices=["good", "bad"])
+    p.add_argument("note", nargs="*")
+    p.add_argument("--profile")
+    p.set_defaults(fn=cmd_grade)
+    p = sub.add_parser("resume")
+    p.set_defaults(fn=cmd_resume)
+    p = sub.add_parser("doctor")
+    p.add_argument("--probe", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fast", action="store_true", help="skip the unit test run")
+    p.set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("install")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true", help="replace a skill symlink that points elsewhere")
+    p.set_defaults(fn=cmd_install)
+    p = sub.add_parser("uninstall")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_uninstall)
+    a = ap.parse_args()
+    try:
+        return a.fn(a)
+    except Usage as e:
+        err(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

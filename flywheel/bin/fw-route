@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Mechanical routing per WP: class/risk -> stages, models, efforts, exploration sampling."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+
+CLASSES = ("none", "light", "full")
+RISKS = ("normal", "high")
+
+DEFAULTS = {
+    "split_threshold": 500, "audit_one_in": 5, "experiment_one_in": 6, "experiments_max_per_run": 3,
+    "planner_high_kinds": ["parity", "algorithmic", "architecture"],
+    "models": {"planner": "opus", "implementer": "sonnet", "implementer_high_risk": "opus",
+               "reviewer": "opus", "verify": "opus", "helper": "sonnet"},
+    "efforts": {"planner": "medium", "planner_high": "high", "implementer": "medium",
+                "reviewer": "medium", "verify": "medium", "helper": "medium"},
+}
+
+
+class Usage(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_config() -> dict:
+    for base in (fwlib.FW_HOME, Path(__file__).resolve().parent.parent):
+        p = base / "skill" / "routing.toml"
+        if p.is_file():
+            try:
+                user = tomllib.loads(p.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError) as e:
+                raise Usage(f"{p}: {e}")
+            cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULTS.items()}
+            for k, v in user.items():
+                if isinstance(v, dict):
+                    cfg[k] = {**cfg.get(k, {}), **v}
+                else:
+                    cfg[k] = v
+            return cfg
+    return DEFAULTS
+
+
+def parse_requirements(path: str) -> dict:
+    try:
+        text = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as e:
+        raise Usage(f"cannot read requirements: {e}")
+    # Only lines that begin with a recognised key (after optional markdown bullets/headings) count;
+    # within such a line a key may also follow sentence punctuation ("Class: full. Risk: normal.").
+    # The first match per key wins.
+    lines = []
+    for ln in text.splitlines():
+        ln = re.sub(r"^[\s#*\-]+", "", ln)
+        if re.match(r"(?:class|risk|kind|size|edits)\s*:", ln, re.I):
+            lines.append(ln)
+
+    def find(key, val):
+        for ln in lines:
+            m = re.search(rf"(?:^|[.;,]\s+){key}:\s*{val}", ln, re.I)
+            if m:
+                return m.group(1)
+        return None
+
+    out = {}
+    v = find("Class", r"([A-Za-z-]+)")
+    if v:
+        out["class"] = v.lower()
+    v = find("Risk", r"([A-Za-z-]+)")
+    if v:
+        out["risk"] = v.lower()
+    v = find("Kind", r"([^\s.;,]+)")
+    if v:
+        out["kind"] = v.lower()
+    v = find("Size", r"~?(\d+)")
+    if v:
+        out["size"] = int(v)
+    v = find("Edits", r"(\S+)")
+    if v and v.lower().startswith("exact"):
+        out["edits_exact"] = True
+    return out
+
+
+def sample(prefix: str, run: str | None, wp: str | None, one_in: int) -> bool:
+    key = f"{prefix}{run}:{wp}"
+    return int(hashlib.sha256(key.encode()).hexdigest(), 16) % one_in == 0
+
+
+def route(a, cfg) -> dict:
+    spec = parse_requirements(a.requirements) if a.requirements else {}
+    for k, v in (("class", a.cls), ("risk", a.risk), ("kind", a.kind), ("size", a.size)):
+        if v is not None:
+            spec[k] = v.lower() if isinstance(v, str) else v
+    if a.edits_exact:
+        spec["edits_exact"] = True
+    warnings = []
+    cls, risk = spec.get("class"), spec.get("risk")
+    if cls is None:
+        cls = "full"
+        warnings.append("class missing: defaulted to full")
+    if risk is None:
+        risk = "normal"
+        warnings.append("risk missing: defaulted to normal")
+    if cls not in CLASSES:
+        raise Usage(f"unknown class {cls!r}; expected one of {CLASSES}")
+    if risk not in RISKS:
+        raise Usage(f"unknown risk {risk!r}; expected one of {RISKS}")
+    kind, size, exact = spec.get("kind"), spec.get("size"), bool(spec.get("edits_exact"))
+
+    if cls == "none":
+        stages = []
+    elif cls == "light":
+        stages = ["implement", "review-b" if kind == "test" else "review-a"]
+        if not exact:
+            stages.insert(0, "plan")
+    else:
+        stages = ["plan", "implement", "review-a", "review-b", "verify"]
+
+    audit = False
+    if cls in ("light", "none"):
+        audit = sample("", a.run, a.wp, cfg["audit_one_in"])
+        if audit:
+            stages.append("audit-review")
+
+    m, e = cfg["models"], cfg["efforts"]
+    roles = {}
+    if cls == "none":
+        stages_for_roles = []
+    else:
+        stages_for_roles = stages
+    if "plan" in stages_for_roles:
+        high = cls == "full" and (risk == "high" or kind in cfg["planner_high_kinds"])
+        roles["planner"] = {"model": m["planner"], "effort": e["planner_high"] if high else e["planner"]}
+    if "implement" in stages_for_roles:
+        roles["implementer"] = {"model": m["implementer_high_risk"] if risk == "high" else m["implementer"],
+                                "effort": e["implementer"]}
+    rev = {"model": m["reviewer"], "effort": e["reviewer"]}
+    if "review-a" in stages_for_roles or "audit-review" in stages_for_roles:
+        roles["reviewer_a"] = dict(rev)
+    if "review-b" in stages_for_roles or "audit-review" in stages_for_roles:
+        roles["reviewer_b"] = dict(rev)
+    if "verify" in stages_for_roles:
+        roles["verify"] = {"model": m["verify"], "effort": e["verify"]}
+    if stages_for_roles:
+        roles["helper"] = {"model": m["helper"], "effort": e["helper"]}
+
+    experiment = None
+    if cls == "full" and risk == "normal" and a.experiments_used < cfg["experiments_max_per_run"] \
+            and sample("exp:", a.run, a.wp, cfg["experiment_one_in"]):
+        experiment = {"role": "implementer", "arms": ["sonnet", "opus"],
+                      "note": "paired comparison (R45): run the alternate arm on a scratch copy and score both"}
+
+    if size is not None and size > cfg["split_threshold"]:
+        warnings.append(f"size {size} > split threshold {cfg['split_threshold']}: split the WP (R35)")
+
+    return {"class": cls, "risk": risk, "kind": kind, "stages": stages, "roles": roles,
+            "audit": audit, "experiment": experiment, "warnings": warnings}
+
+
+def main() -> int:
+    ap = Parser(prog="fw-route")
+    ap.add_argument("--requirements")
+    ap.add_argument("--class", dest="cls")
+    ap.add_argument("--risk")
+    ap.add_argument("--kind")
+    ap.add_argument("--size", type=int)
+    ap.add_argument("--edits-exact", action="store_true")
+    ap.add_argument("--wp")
+    ap.add_argument("--run")
+    ap.add_argument("--experiments-used", type=int, default=0)
+    a = ap.parse_args()
+    try:
+        fwlib.emit(route(a, load_config()))
+        return 0
+    except Usage as e:
+        print(f"fw-route: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        print(f"fw-route: internal error: {e!r}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

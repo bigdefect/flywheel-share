@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.flywheel.watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<string>@FW_HOME@/bin/fw-watchdog</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>@PATH@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>FW_HOME</key>
+		<string>@FW_HOME@</string>
+		<key>FW_STATE</key>
+		<string>@FW_STATE@</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>@FW_STATE@/watchdog.launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@FW_STATE@/watchdog.launchd.log</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+</dict>
+</plist>

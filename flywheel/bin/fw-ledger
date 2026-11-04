@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Judgement-call ledger: append, query, due scorings, git signals, tallies."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import secrets
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+
+HORIZONS = ("1d", "30c7d", "review", "user")
+VERDICTS = ("better", "worse", "neutral", "unknown")
+FIX_RE = re.compile(r"\b(fix|regress|revert|repair|broken|bug)\b", re.I)
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+STATUS_RE = re.compile(r"\b(OPEN|DONE|CLOSED|RULED OUT)\b")
+
+
+class Usage(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def lpath(repo: str) -> Path:
+    try:
+        return fwlib.ledger_path(repo)
+    except ValueError as e:
+        raise Usage(str(e))
+
+
+def profile(repo: str) -> dict:
+    try:
+        return fwlib.load_profile(repo)
+    except (OSError, ValueError, KeyError) as e:
+        raise Usage(f"cannot load profile {repo!r}: {e}")
+
+
+def parse_obj(s: str, what: str) -> dict:
+    try:
+        o = json.loads(s)
+    except json.JSONDecodeError as e:
+        raise Usage(f"{what} is not valid JSON: {e}")
+    if not isinstance(o, dict):
+        raise Usage(f"{what} must be a JSON object")
+    return o
+
+
+def is_str(v) -> bool:
+    return isinstance(v, str) and v != ""
+
+
+def validate_call(c: dict) -> list[str]:
+    bad = []
+    if not is_str(c.get("run")):
+        bad.append("run: required non-empty string")
+    if "wp" not in c or not (c["wp"] is None or isinstance(c["wp"], str)):
+        bad.append("wp: required string or null")
+    if not is_str(c.get("rule")):
+        bad.append("rule: required non-empty string")
+    if not isinstance(c.get("departure"), bool):
+        bad.append("departure: required bool")
+    opts = c.get("options")
+    labels = []
+    if not isinstance(opts, list) or not opts:
+        bad.append("options: required list with at least 1 entry")
+    else:
+        for i, o in enumerate(opts):
+            if not isinstance(o, dict) or not is_str(o.get("label")):
+                bad.append(f"options[{i}]: must be an object with a string label")
+            else:
+                labels.append(o["label"])
+                for k in ("cost_min", "cost_mtok"):
+                    if k in o and (isinstance(o[k], bool) or not isinstance(o[k], (int, float))):
+                        bad.append(f"options[{i}].{k}: must be a number")
+                if "user_visible_effect" in o and not isinstance(o["user_visible_effect"], str):
+                    bad.append(f"options[{i}].user_visible_effect: must be a string")
+    if not is_str(c.get("chosen")):
+        bad.append("chosen: required non-empty string")
+    elif labels and c["chosen"] not in labels:
+        bad.append(f"chosen: {c['chosen']!r} does not match any option label {labels}")
+    if not is_str(c.get("prediction")):
+        bad.append("prediction: required non-empty string")
+    if not is_str(c.get("reason_class")):
+        bad.append("reason_class: required non-empty string")
+    if "context" in c and not isinstance(c["context"], str):
+        bad.append("context: must be a string")
+    if "residue" in c:
+        r = c["residue"]
+        if not isinstance(r, list):
+            bad.append("residue: must be a list")
+        else:
+            for i, e in enumerate(r):
+                if not isinstance(e, dict) or any(k not in e for k in ("item", "introduced_by_wp", "evidence", "severity")):
+                    bad.append(f"residue[{i}]: needs item, introduced_by_wp, evidence, severity")
+    for k in ("round_commits", "files", "tags"):
+        if k in c and not (isinstance(c[k], list) and all(isinstance(x, str) for x in c[k])):
+            bad.append(f"{k}: must be a list of strings")
+    if "merged_commit" in c and not (isinstance(c["merged_commit"], str) and COMMIT_RE.match(c["merged_commit"])):
+        bad.append("merged_commit: must match ^[0-9a-f]{7,40}$")
+    if "score_at" in c:
+        sa = c["score_at"]
+        if not isinstance(sa, dict):
+            bad.append("score_at: must be an object of horizon -> ISO string or null")
+        else:
+            for k, v in sa.items():
+                if k not in HORIZONS:
+                    bad.append(f"score_at.{k}: unknown horizon")
+                elif v is not None and (not isinstance(v, str) or fwlib.parse_iso(v) is None):
+                    bad.append(f"score_at.{k}: must be an ISO timestamp string or null")
+    if "user_prediction" in c:
+        e = c["user_prediction"]
+        if not isinstance(e, dict) or "choice" not in e or "confidence" not in e:
+            bad.append("user_prediction: needs choice and confidence")
+    if "confounders" in c and not isinstance(c["confounders"], dict):
+        bad.append("confounders: must be an object")
+    if "decider" in c and c["decider"] not in ("orchestrator", "oracle", "user"):
+        bad.append("decider: must be orchestrator|oracle|user")
+    return bad
+
+
+DUPLICATES: list[str] = []
+
+
+def id_keys(r: dict) -> tuple[str, ...]:
+    t = r.get("type")
+    if t == "call":
+        return ("id",)
+    if t == "event":
+        return ("of",)
+    return ()
+
+
+def calls_and_events(repo: str):
+    calls: dict[str, dict] = {}
+    events: dict[str, list[dict]] = {}
+    for r in fwlib.read_jsonl_objects(lpath(repo), id_keys):
+        if r.get("type") == "call" and isinstance(r.get("id"), str) and r["id"]:
+            if r["id"] in calls:
+                DUPLICATES.append(r["id"])
+                continue
+            calls[r["id"]] = r
+        elif r.get("type") == "event" and r.get("of"):
+            events.setdefault(r["of"], []).append(r)
+    return calls, events
+
+
+def latest_verdict(evs: list[dict]):
+    scores = [e for e in evs if e.get("kind") == "score"]
+    good = [e["verdict"] for e in scores if isinstance(e.get("verdict"), str) and e["verdict"] in VERDICTS
+            and e["verdict"] != "unknown"]
+    if good:
+        return good[-1]
+    return "unknown" if scores else None
+
+
+def grades(evs):
+    return [e for e in evs if e.get("kind") == "grade"]
+
+
+def cmd_add(a) -> int:
+    raw = a.json if a.json is not None else sys.stdin.read()
+    c = parse_obj(raw, "input")
+    bad = validate_call(c)
+    if bad:
+        raise Usage("invalid call:\n  " + "\n  ".join(bad))
+    t = fwlib.now()
+    rec = dict(c)
+    rec["ts"] = fwlib.iso(t)
+    rec["type"] = "call"
+    sa = dict(rec.get("score_at") or {})
+    sa.setdefault("1d", fwlib.iso(t + dt.timedelta(days=1)))
+    sa.setdefault("30c7d", fwlib.iso(t + dt.timedelta(days=7)))
+    sa.setdefault("review", None)
+    rec["score_at"] = sa
+    path = lpath(a.repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with fwlib.locked(path):
+        used = {r["id"] for r in fwlib.read_jsonl_objects(path, id_keys) if isinstance(r.get("id"), str)}
+        while True:
+            rec["id"] = f"L-{t:%Y%m%d}-{secrets.token_hex(2)}"
+            if rec["id"] not in used:
+                break
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    fwlib.emit(rec)
+    return 0
+
+
+def cmd_event(a) -> int:
+    p = parse_obj(a.json, "--json")
+    bad = []
+    if a.kind == "score":
+        if p.get("horizon") not in HORIZONS:
+            bad.append(f"horizon: must be one of {HORIZONS}")
+        if p.get("verdict") not in VERDICTS:
+            bad.append(f"verdict: must be one of {VERDICTS}")
+        if not is_str(p.get("evidence")):
+            bad.append("evidence: required non-empty string")
+    elif a.kind == "grade":
+        if p.get("grade") not in ("good", "bad"):
+            bad.append("grade: must be good|bad")
+        if "note" in p and not isinstance(p["note"], str):
+            bad.append("note: must be a string")
+    if bad:
+        raise Usage("invalid event:\n  " + "\n  ".join(bad))
+    calls, _ = calls_and_events(a.repo)
+    if a.id not in calls:
+        raise Usage(f"unknown ledger id {a.id}")
+    rec = {k: v for k, v in p.items() if k not in ("type", "of", "kind", "ts")}
+    rec.update({"type": "event", "of": a.id, "kind": a.kind, "ts": fwlib.iso()})
+    fwlib.append_jsonl(lpath(a.repo), rec)
+    fwlib.emit(rec)
+    return 0
+
+
+def cmd_show(a) -> int:
+    calls, events = calls_and_events(a.repo)
+    if a.id not in calls:
+        raise Usage(f"unknown ledger id {a.id}")
+    evs = events.get(a.id, [])
+    out = dict(calls[a.id])
+    out["events"] = evs
+    out["latest_verdict"] = latest_verdict(evs)
+    fwlib.emit(out)
+    return 0
+
+
+def cmd_query(a) -> int:
+    if a.limit < 0:
+        raise Usage("--limit must be >= 0")
+    calls, events = calls_and_events(a.repo)
+    out = []
+    for c in reversed(list(calls.values())):
+        if a.rule and c.get("rule") != a.rule:
+            continue
+        if a.tag and a.tag not in (c.get("tags") or []):
+            continue
+        if a.wp is not None and str(c.get("wp")) != a.wp:
+            continue
+        if a.reason_class and c.get("reason_class") != a.reason_class:
+            continue
+        if a.text:
+            hay = " ".join([c.get("context") or "", c.get("prediction") or "", c.get("chosen") or ""]
+                           + [str(o.get("label", "")) for o in c.get("options") or []]).lower()
+            if a.text.lower() not in hay:
+                continue
+        evs = events.get(c["id"], [])
+        r = dict(c)
+        r["latest_verdict"] = latest_verdict(evs)
+        r["grades"] = grades(evs)
+        if len(out) >= a.limit:
+            break
+        out.append(r)
+    fwlib.emit(out)
+    return 0
+
+
+def cmd_due(a) -> int:
+    at = fwlib.parse_iso(a.at) if a.at else fwlib.now()
+    if at is None:
+        raise Usage(f"--at is not an ISO timestamp: {a.at!r}")
+    calls, events = calls_and_events(a.repo)
+    prof = None
+    out = []
+    for cid, c in calls.items():
+        scored = {e.get("horizon") for e in events.get(cid, [])
+                  if e.get("kind") == "score" and isinstance(e.get("horizon"), str)}
+        sa = c.get("score_at") if isinstance(c.get("score_at"), dict) else {}
+        for h in ("1d", "30c7d", "review"):
+            if h in scored:
+                continue
+            since = fwlib.parse_iso(sa.get(h))
+            if since is not None and since <= at:
+                out.append({"id": cid, "horizon": h, "due_since": fwlib.iso(since)})
+                continue
+            mc = c.get("merged_commit")
+            if h == "30c7d" and c.get("files") and isinstance(mc, str) and COMMIT_RE.match(mc):
+                if prof is None:
+                    try:
+                        prof = profile(a.repo)
+                    except Usage as e:
+                        print(f"fw-ledger: {e}; skipping commit-count check", file=sys.stderr)
+                        prof = {}
+                if not prof.get("repo"):
+                    continue
+                s = fwlib.git(prof["repo"], "rev-list", "--count", "--end-of-options",
+                              f"{mc}..{prof.get('default_branch', 'main')}", "--", *c["files"]).strip()
+                if s.isdigit() and int(s) >= 30:
+                    out.append({"id": cid, "horizon": h, "due_since": fwlib.iso(at)})
+    fwlib.emit(out)
+    return 0
+
+
+def cmd_signals(a) -> int:
+    calls, _ = calls_and_events(a.repo)
+    if a.id not in calls:
+        raise Usage(f"unknown ledger id {a.id}")
+    c = calls[a.id]
+    prof = profile(a.repo)
+    repo, branch = prof["repo"], prof.get("default_branch", "main")
+    notes = []
+    later, cands, reverts = [], [], []
+    merged, files = c.get("merged_commit"), c.get("files")
+    if merged is not None and not (isinstance(merged, str) and COMMIT_RE.match(merged)):
+        merged = None
+    if not merged:
+        notes.append("no merged_commit recorded: later_commits, fix_candidates, reverts are empty")
+    if not files:
+        notes.append("no files recorded: later_commits and fix_candidates are empty")
+    if merged and files:
+        txt = fwlib.git(repo, "log", "--max-count=100", "--format=%H%x1f%aI%x1f%s",
+                        "--end-of-options", f"{merged}..{branch}", "--", *files)
+        for line in txt.splitlines():
+            h, d, s = (line.split("\x1f") + ["", ""])[:3]
+            later.append({"hash": h, "date": d, "subject": s})
+        cands = [dict(x, candidate=True) for x in later if FIX_RE.search(x["subject"])]
+    if merged:
+        txt = fwlib.git(repo, "log", "--max-count=1000", "--format=%H%x1f%aI%x1f%B%x1e",
+                        "--end-of-options", f"{merged}..{branch}")
+        tag = re.compile(rf"\bWP-{re.escape(str(c['wp']))}\b") if c.get("wp") else None
+        pat = re.compile(r"This reverts commit " + re.escape(merged[:12]))
+        for rec in txt.split("\x1e"):
+            rec = rec.strip("\n")
+            if not rec:
+                continue
+            h, d, msg = (rec.split("\x1f", 2) + ["", ""])[:3]
+            subject = msg.strip().splitlines()[0] if msg.strip() else ""
+            if pat.search(msg) or (tag and subject.startswith("Revert") and tag.search(msg)):
+                reverts.append({"hash": h, "date": d, "subject": subject})
+    followups = []
+    if c.get("wp"):
+        fpath = Path(repo) / prof.get("followups", "docs/runs/FOLLOWUPS.md")
+        try:
+            lines = fpath.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+            notes.append(f"followups file not readable: {fpath}")
+        wp_re = re.compile(rf"\bWP-{re.escape(str(c['wp']))}\b")
+        for i, ln in enumerate(lines, 1):
+            if wp_re.search(ln):
+                m = STATUS_RE.search(ln)
+                followups.append({"line": i, "text": ln.strip(), "status": m.group(1) if m else None})
+    t = fwlib.parse_iso(c.get("ts"))
+    days = round((fwlib.now() - t).total_seconds() / 86400, 2) if t else None
+    fwlib.emit({"id": a.id, "later_commits": later, "fix_candidates": cands, "reverts": reverts,
+                "followups": followups, "days_since": days, "notes": notes})
+    return 0
+
+
+def cmd_tally(a) -> int:
+    calls, events = calls_and_events(a.repo)
+    rules: dict[str, dict] = {}
+    for cid, c in calls.items():
+        rule = c.get("rule", "?")
+        r = rules.setdefault(rule if isinstance(rule, str) else "?", {
+            "calls": 0, "departures": 0,
+            "departure_verdicts": dict.fromkeys(VERDICTS, 0),
+            "other_verdicts": dict.fromkeys(VERDICTS, 0),
+            "user_match": {"n": 0, "matched": 0}})
+        evs = events.get(cid, [])
+        v = latest_verdict(evs) or "unknown"
+        r["calls"] += 1
+        if c.get("departure"):
+            r["departures"] += 1
+            r["departure_verdicts"][v] += 1
+        else:
+            r["other_verdicts"][v] += 1
+        ep = c.get("user_prediction")
+        if isinstance(ep, dict):
+            choice = None
+            for e in evs:
+                if e.get("kind") in ("override", "grade") or (e.get("kind") == "score" and e.get("horizon") == "user"):
+                    ch = e.get("user_choice", e.get("choice") if e.get("kind") == "override" else None)
+                    if ch is not None:
+                        choice = ch
+            if choice is not None:
+                r["user_match"]["n"] += 1
+                r["user_match"]["matched"] += choice == ep.get("choice")
+    flags = {"propose-rewrite": [], "hard-prior": []}
+    for name, r in rules.items():
+        dv = r["departure_verdicts"]
+        r["flags"] = []
+        if dv["better"] + dv["neutral"] >= 3 and dv["worse"] == 0:
+            r["flags"].append("propose-rewrite")
+            flags["propose-rewrite"].append(name)
+        if dv["worse"] >= 1:
+            r["flags"].append("hard-prior")
+            flags["hard-prior"].append(name)
+    fwlib.emit({"rules": rules, "flags": flags, "warnings": [f"duplicate ledger id {d}" for d in sorted(set(DUPLICATES))]})
+    return 0
+
+
+def main() -> int:
+    ap = Parser(prog="fw-ledger")
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    def mk(name, fn):
+        p = sub.add_parser(name)
+        p.add_argument("--repo", required=True)
+        p.set_defaults(fn=fn)
+        return p
+
+    p = mk("add", cmd_add)
+    p.add_argument("--json")
+    p = mk("event", cmd_event)
+    p.add_argument("--id", required=True)
+    p.add_argument("--kind", required=True, choices=["score", "grade", "note", "override"])
+    p.add_argument("--json", required=True)
+    p = mk("show", cmd_show)
+    p.add_argument("--id", required=True)
+    p = mk("query", cmd_query)
+    p.add_argument("--rule")
+    p.add_argument("--tag")
+    p.add_argument("--wp")
+    p.add_argument("--text")
+    p.add_argument("--reason-class")
+    p.add_argument("--limit", type=int, default=10)
+    p = mk("due", cmd_due)
+    p.add_argument("--at")
+    p = mk("signals", cmd_signals)
+    p.add_argument("--id", required=True)
+    mk("tally", cmd_tally)
+    a = ap.parse_args()
+    try:
+        return a.fn(a)
+    except Usage as e:
+        print(f"fw-ledger: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        print(f"fw-ledger: internal error: {e!r}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

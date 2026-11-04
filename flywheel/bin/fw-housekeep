@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+"""Housekeeping: garbage-collect registered flywheel resources and report on the environment."""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fwlib  # noqa: E402
+
+DAY = 86400
+ARCHIVE_SUFFIXES = {".md", ".jsonl", ".tsv", ".json"}
+LOG_ROTATE_BYTES = 1024 * 1024
+LOG_KEEP = 3
+READINGS_KEEP_S = 30 * 60
+TERM_WAIT_S = 10.0
+HEAVY_PCPU = 80.0
+HEAVY_ETIME_S = 30 * 60
+SNAPSHOT_QUIET_S = 10 * 60
+OBJ_RE = re.compile(r"^([A-Za-z0-9_]+-[0-9a-f]{16})\.[a-z0-9]+\.([a-z0-9]+)\.rcgu\.o$")
+
+
+class Refused(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------- safety core
+
+def _abspath(path: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _fold(name: str) -> str:
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+
+
+def _key(p: Path) -> tuple[str, ...]:
+    return tuple(_fold(x) for x in p.parts)
+
+
+def canonical_case(path: Path, strict: bool = False) -> Path:
+    """Rewrite each existing component of an absolute, resolved path to its on-disk spelling.
+
+    APFS and HFS+ are case- and normalisation-insensitive by default and realpath keeps the caller's
+    spelling, so string comparison alone cannot tell that `DEV` and `dev` are one directory.
+    With strict, raise Refused when the spelling of an existing component cannot be determined.
+    """
+    out = Path(path.anchor)
+    parts = path.parts[1:]
+    for i, name in enumerate(parts):
+        if not os.path.lexists(out / name):
+            return out.joinpath(*parts[i:])
+        try:
+            with os.scandir(out) as it:
+                names = [en.name for en in it]
+        except OSError as e:
+            if strict:
+                raise Refused(f"{path}: cannot list {out} to find the on-disk spelling: {e}") from e
+            return out.joinpath(*parts[i:])
+        if name not in names:
+            matches = [n for n in names if _fold(n) == _fold(name)]
+            if len(matches) != 1:
+                if strict:
+                    raise Refused(f"{path}: cannot find the on-disk spelling of {name!r} in {out}")
+                return out.joinpath(*parts[i:])
+            name = matches[0]
+        out = out / name
+    return out
+
+
+def check_rmtree(path: str | Path, allowed_roots: list[str | Path], protected: list[str | Path] = ()) -> tuple[Path, bool]:
+    """Return (resolved path, is_symlink) if deleting `path` is allowed; raise Refused otherwise.
+
+    Protection is checked on case-folded components (equal to, or an ancestor of, a guarded path);
+    containment in a root is checked on the exact on-disk spelling.
+    """
+    p = _abspath(path)
+    is_link = p.is_symlink()
+    resolved = canonical_case((p.parent.resolve() / p.name) if is_link else p.resolve(), strict=True)
+    roots = [canonical_case(_abspath(r).resolve()) for r in allowed_roots]
+    guarded = [Path("/"), canonical_case(Path.home().resolve()), *roots,
+               *(canonical_case(_abspath(q).resolve()) for q in protected)]
+    rk = _key(resolved)
+    for g in guarded:
+        if _key(g)[:len(rk)] == rk:
+            raise Refused(f"{resolved}: is or contains protected path {g}")
+    if not any(len(resolved.parts) > len(r.parts) and resolved.parts[:len(r.parts)] == r.parts for r in roots):
+        raise Refused(f"{resolved}: not inside an allowed root")
+    if not is_link and os.path.lexists(resolved / ".git"):
+        raise Refused(f"{resolved}: contains .git")
+    return resolved, is_link
+
+
+def safe_rmtree(path: str | Path, allowed_roots: list[str | Path], protected: list[str | Path] = (),
+                dry_run: bool = False) -> str:
+    """Delete a directory tree or file after check_rmtree. A symlink is unlinked, never followed."""
+    resolved, is_link = check_rmtree(path, allowed_roots, protected)
+    if dry_run:
+        return "dry-run"
+    if is_link:
+        os.unlink(resolved)
+        return "unlinked-symlink"
+    if not os.path.lexists(resolved):
+        return "missing"
+    if resolved.is_dir():
+        shutil.rmtree(resolved)
+    else:
+        os.unlink(resolved)
+    return "deleted"
+
+
+# ---------------------------------------------------------------- registry
+
+def load_registry(path: Path) -> dict[str, dict]:
+    entries: dict[str, dict] = {}
+    removed: set[str] = set()
+    for ev in fwlib.read_jsonl(path):
+        if not isinstance(ev, dict):
+            continue
+        i, kind = ev.get("id"), ev.get("event")
+        if not i or not isinstance(i, str):
+            continue
+        if kind == "add":
+            e = dict(ev)
+            e["meta"] = dict(ev.get("meta") or {}) if isinstance(ev.get("meta"), dict) else {}
+            entries[i] = e
+        elif kind == "update" and i in entries and isinstance(ev.get("meta"), dict):
+            entries[i]["meta"].update(ev["meta"])
+        elif kind == "remove":
+            removed.add(i)
+    return {i: e for i, e in entries.items() if i not in removed}
+
+
+# ---------------------------------------------------------------- parsers
+
+def parse_etime(s: str) -> int | None:
+    """Parse ps etime `[[dd-]hh:]mm:ss` into seconds."""
+    try:
+        days = 0
+        if "-" in s:
+            d, s = s.split("-", 1)
+            days = int(d)
+        parts = [int(x) for x in s.split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        h, (m, sec) = 0, parts
+    elif len(parts) == 3:
+        h, m, sec = parts
+    else:
+        return None
+    return days * DAY + h * 3600 + m * 60 + sec
+
+
+def parse_ps_line(line: str) -> dict | None:
+    parts = line.split(None, 3)
+    if len(parts) < 4:
+        return None
+    try:
+        pid, pcpu = int(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    etime = parse_etime(parts[2])
+    if etime is None:
+        return None
+    return {"pid": pid, "pcpu": pcpu, "etime_s": etime, "comm": parts[3].strip()}
+
+
+def heavy_processes(lines: list[str], registered: set[int]) -> list[dict]:
+    out = []
+    for line in lines:
+        p = parse_ps_line(line)
+        if p and p["pid"] not in registered and p["pcpu"] > HEAVY_PCPU and p["etime_s"] > HEAVY_ETIME_S:
+            out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------- helpers
+
+def _norm(p: str | Path | None) -> str:
+    if not p:
+        return ""
+    return str(canonical_case(_abspath(p).resolve()))
+
+
+def _age_s(path: Path) -> float:
+    return time.time() - path.stat().st_mtime
+
+
+def _ws(s: str | None) -> str:
+    return " ".join((s or "").split())
+
+
+def proc_start(pid: int) -> str:
+    r = fwlib.run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+    return _ws(r.stdout) if r.returncode == 0 else ""
+
+
+def proc_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    r = fwlib.run(["ps", "-o", "stat=", "-p", str(pid)], timeout=10)
+    stat = r.stdout.strip()
+    return r.returncode == 0 and bool(stat) and not stat.startswith("Z")
+
+
+def snapshot_dirs() -> list[Path]:
+    """Directories whose uncommitted edits get snapshot commits: FW_SNAPSHOT_DIRS (os.pathsep-separated), else
+    ~/.agents, but only for the real state dir so test runs never commit to the user's repos."""
+    v = os.environ.get("FW_SNAPSHOT_DIRS")
+    if v is not None:
+        return [Path(x).expanduser() for x in v.split(os.pathsep) if x]
+    if _norm(fwlib.FW_STATE) != _norm(Path.home() / ".local/state/flywheel"):
+        return []
+    return [Path.home() / ".agents"]
+
+
+def repo_root(d: Path) -> Path | None:
+    """Nearest ancestor (or d) holding .git. Walks the tree itself because GIT_CEILING_DIRECTORIES can hide an
+    enclosing repo from git's own discovery."""
+    for c in (d, *d.parents):
+        if (c / ".git").exists():
+            return c
+    return None
+
+
+def porcelain_paths(out: str) -> list[str]:
+    """Paths from `git status --porcelain -z` (rename/copy entries carry their source as the next field)."""
+    fields = out.split("\0")
+    paths, i = [], 0
+    while i < len(fields):
+        f = fields[i]
+        i += 1
+        if len(f) < 4:
+            continue
+        paths.append(f[3:])
+        if f[0] in "RC":
+            i += 1
+    return paths
+
+
+def temp_root() -> Path:
+    """tempfile.gettempdir()'s choice without its write probe, so dry runs leave $TMPDIR untouched."""
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(var)
+        if v and os.path.isdir(v):
+            return Path(v)
+    return Path("/tmp")
+
+
+def disk_free_gb() -> float:
+    env = os.environ.get("FW_TEST_DISK_FREE_GB")
+    if env is not None:
+        return float(env)
+    return round(shutil.disk_usage(str(Path.home())).free / 1e9, 1)
+
+
+def disk_tier(gb: float) -> str:
+    if gb < 10:
+        return "stop"
+    if gb < 25:
+        return "critical"
+    if gb < 60:
+        return "low"
+    return "ok"
+
+
+# ---------------------------------------------------------------- housekeeper
+
+class Housekeeper:
+    def __init__(self, mode: str, profile: dict | None, dry_run: bool, allow_main_clean: bool):
+        self.mode = mode
+        self.profile = profile
+        self.dry_run = dry_run
+        self.allow_main_clean = allow_main_clean
+        self.state = fwlib.FW_STATE
+        self.registry_file = self.state / "registry.jsonl"
+        self.reg = load_registry(self.registry_file)
+        self.actions: list[dict] = []
+        self.reports: list[dict] = []
+        self.errors: list[str] = []
+        self.disk_free_gb: float | None = None
+        self.roots = self._allowed_roots()
+        self.protected = self._protected_paths()
+
+    def _allowed_roots(self) -> list[Path]:
+        roots = [self.state, temp_root(), Path("/tmp")]
+        if self.profile:
+            repo = Path(self.profile["repo"])
+            wr = self.profile.get("worktree_root")
+            if wr:
+                p = Path(wr).expanduser()
+                roots.append(p if p.is_absolute() else repo / p)
+            for x in self.profile.get("extra_clean_roots", []) or []:
+                p = Path(x).expanduser()
+                if p.is_absolute():
+                    roots.append(p)
+                else:
+                    self.errors.append(f"config: extra_clean_roots entry not absolute, ignored: {x}")
+        return roots
+
+    def _protected_paths(self) -> list[Path]:
+        prot = [fwlib.FW_HOME]
+        if self.profile:
+            prot.append(Path(self.profile["repo"]))
+        for f in sorted((fwlib.FW_HOME / "profiles").glob("*.md")):
+            try:
+                prot.append(Path(fwlib.load_profile(f.stem)["repo"]))
+            except Exception:  # noqa: BLE001
+                continue
+        return prot
+
+    # -- recording
+
+    def act(self, task: str, action: str, target: str, result: str) -> None:
+        self.actions.append({"task": task, "action": action, "target": str(target), "result": result})
+
+    def report(self, task: str, message: str, target: str | None = None) -> None:
+        self.reports.append({"task": task, "message": message, "target": str(target) if target else None})
+
+    def rm(self, task: str, path: str | Path) -> bool:
+        try:
+            res = safe_rmtree(path, self.roots, self.protected, self.dry_run)
+        except Refused as e:
+            self.errors.append(f"{task}: refused delete: {e}")
+            return False
+        except OSError as e:
+            self.errors.append(f"{task}: delete failed: {path}: {e}")
+            return False
+        self.act(task, "delete", str(path), res)
+        return True
+
+    def mark_removed(self, task: str, entry: dict, reason: str, **extra: str) -> None:
+        self.reg.pop(entry["id"], None)
+        if not self.dry_run:
+            ev = {"event": "remove", "id": entry["id"], "ts": fwlib.iso(), "reason": reason, **extra}
+            fwlib.append_jsonl(self.registry_file, ev)
+        self.act(task, "registry-remove", entry.get("path") or entry["id"], "dry-run" if self.dry_run else reason)
+
+    def active(self, kind: str) -> list[dict]:
+        return [e for e in list(self.reg.values()) if e.get("kind") == kind]
+
+    def _repo_match(self, entry: dict) -> bool:
+        return _norm(entry.get("repo")) == _norm(self.profile["repo"])
+
+    # -- tasks
+
+    def task_disk(self) -> None:
+        gb = disk_free_gb()
+        self.disk_free_gb = gb
+        self.report("disk", f"{gb:g} GB free on home volume: {disk_tier(gb)}", str(Path.home()))
+
+    def task_worktrees(self) -> None:
+        repo = Path(self.profile["repo"])
+        repo_n = _norm(repo)
+        default = self.profile.get("default_branch", "main")
+        for e in self.active("worktree"):
+            if not self._repo_match(e) or not e.get("path"):
+                continue
+            try:
+                self._worktree_one(e, repo, repo_n, default)
+            except Exception as ex:  # noqa: BLE001
+                self.errors.append(f"worktrees: {e.get('path')}: {ex!r}")
+
+    def _worktree_one(self, e: dict, repo: Path, repo_n: str, default: str) -> None:
+        task = "worktrees"
+        wt = Path(e["path"])
+        wt_n = _norm(wt)
+        if wt_n == repo_n:
+            self.report(task, "registered worktree is the main checkout; skipped", wt)
+            return
+        if not wt.exists():
+            if self.dry_run:
+                self.act(task, "git worktree prune", str(repo), "dry-run")
+            else:
+                r = fwlib.run(["git", "-C", str(repo), "worktree", "prune"])
+                self.act(task, "git worktree prune", str(repo), "ok" if r.returncode == 0 else f"failed: {r.stderr.strip()}")
+            self.mark_removed(task, e, "missing")
+            return
+        meta = e["meta"]
+        status = meta.get("status")
+        dropped = status == "dropped"
+        branch = meta.get("branch")
+        if not branch:
+            r = fwlib.run(["git", "-C", str(wt), "symbolic-ref", "--short", "-q", "HEAD"])
+            branch = r.stdout.strip() if r.returncode == 0 else None
+        if branch == default:
+            self.report(task, f"worktree is on default branch {default}; skipped", wt)
+            return
+        if not dropped:
+            if status != "merged":
+                if not branch:
+                    return
+                r = fwlib.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", branch, default])
+                if r.returncode == 1:
+                    return
+                if r.returncode != 0:
+                    self.errors.append(f"{task}: merge-base {branch} {default} failed: {r.stderr.strip()}")
+                    return
+                why = self._unlabelled_merge_blocker(e, repo, branch)
+                if why:
+                    self.report(task, f"branch {branch} is merged but {why}; not removed without status=merged", wt)
+                    return
+            st = fwlib.run(["git", "--no-optional-locks", "-C", str(wt), "status", "--porcelain"])
+            if st.returncode != 0:
+                self.errors.append(f"{task}: git status failed in {wt}: {st.stderr.strip()}")
+                return
+            if st.stdout.strip():
+                self.report(task, f"branch {branch} merged but worktree has uncommitted changes; skipped", wt)
+                return
+
+        r = fwlib.run(["git", "-C", str(wt), "rev-parse", "--verify", "HEAD"])
+        head = r.stdout.strip()
+        if r.returncode != 0 or not head:
+            self.errors.append(f"{task}: cannot read HEAD of {wt}: {r.stderr.strip()}")
+            return
+        keep_ref = None
+        if not self._reachable_elsewhere(repo, head, default, branch):
+            if not dropped:
+                self.report(task, f"worktree HEAD {head[:12]} is not on {default} or any other ref; skipped", wt)
+                return
+            keep_ref = f"refs/flywheel/dropped/{e['id']}"
+            if self.dry_run:
+                self.act(task, "git update-ref", f"{keep_ref} {head}", "dry-run")
+            else:
+                r = fwlib.run(["git", "-C", str(repo), "update-ref", keep_ref, head])
+                if r.returncode != 0:
+                    self.errors.append(f"{task}: git update-ref {keep_ref} {head} failed: {r.stderr.strip()}; "
+                                       f"{wt} not removed")
+                    return
+                self.act(task, "git update-ref", f"{keep_ref} {head}", "ok")
+
+        cmd = ["git", "-C", str(repo), "worktree", "remove", *(["--force"] if dropped else []), str(wt)]
+        label = "git worktree remove" + (" --force" if dropped else "")
+        if self.dry_run:
+            self.act(task, label, str(wt), "dry-run")
+        else:
+            r = fwlib.run(cmd)
+            if r.returncode != 0:
+                self.errors.append(f"{task}: {label} {wt} failed: {r.stderr.strip()}")
+                return
+            self.act(task, label, str(wt), "ok")
+
+        if branch:
+            flag = "-D" if dropped else "-d"
+            if self.dry_run:
+                self.act(task, f"git branch {flag}", branch, "dry-run")
+            else:
+                r = fwlib.run(["git", "-C", str(repo), "branch", flag, branch])
+                if r.returncode == 0:
+                    self.act(task, f"git branch {flag}", branch, "ok")
+                else:
+                    self.errors.append(f"{task}: git branch {flag} {branch} failed: {r.stderr.strip()}")
+
+        for d in self.active("dir"):
+            if _norm(d["meta"].get("worktree")) == wt_n and d.get("path"):
+                if self.rm(task, d["path"]):
+                    self.mark_removed(task, d, "worktree-removed")
+        self.mark_removed(task, e, "dropped" if dropped else "merged", **({"ref": keep_ref} if keep_ref else {}))
+
+    def _unlabelled_merge_blocker(self, e: dict, repo: Path, branch: str) -> str | None:
+        base = e["meta"].get("base")
+        if not base:
+            return "the entry has no base commit"
+        r = fwlib.run(["git", "-C", str(repo), "rev-list", "--count", "--end-of-options", f"{base}..{branch}"])
+        if r.returncode != 0:
+            return f"rev-list {base}..{branch} failed ({r.stderr.strip()})"
+        if int(r.stdout.strip() or "0") < 1:
+            return f"it has no commits beyond base {base[:12]}"
+        added = fwlib.parse_iso(e.get("ts"))
+        if added is None or (fwlib.now() - added).total_seconds() <= DAY:
+            return "the entry is not older than 24 h"
+        return None
+
+    def _reachable_elsewhere(self, repo: Path, head: str, default: str, branch: str | None) -> bool:
+        """True if `head` is on the default branch or on any ref other than the worktree's own branch."""
+        r = fwlib.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head, default])
+        if r.returncode == 0:
+            return True
+        r = fwlib.run(["git", "-C", str(repo), "for-each-ref", "--contains", head, "--format=%(refname)"])
+        if r.returncode != 0:
+            return False
+        own = f"refs/heads/{branch}" if branch else None
+        return any(ref and ref != own for ref in r.stdout.splitlines())
+
+    def task_foreign_worktrees(self) -> None:
+        repo = self.profile["repo"]
+        repo_n = _norm(repo)
+        registered = {_norm(e.get("path")) for e in self.active("worktree")}
+        out = fwlib.git(repo, "worktree", "list", "--porcelain")
+        for line in out.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            p = line[len("worktree "):]
+            pn = _norm(p)
+            if pn == repo_n or pn in registered:
+                continue
+            try:
+                age = _age_s(Path(p))
+            except OSError:
+                continue
+            if age > 7 * DAY:
+                self.report("foreign-worktrees", f"unregistered worktree, {age / DAY:.0f} days old; not touched", p)
+
+    def task_build_dirs(self) -> None:
+        for d in self.active("dir"):
+            if d.get("purpose") != "build" or not self._repo_match(d) or not d.get("path"):
+                continue
+            wt = d["meta"].get("worktree")
+            if not wt or Path(wt).exists():
+                continue
+            if self.rm("build-dirs", d["path"]):
+                self.mark_removed("build-dirs", d, "worktree-gone")
+
+    def task_main_target(self) -> None:
+        prof = self.profile
+        deps = Path(prof["repo"]) / prof.get("main_target_deps", "target/debug/deps")
+        if deps.is_symlink() or not deps.is_dir():
+            return
+        if prof.get("prune_stale_objects"):
+            self.prune_objects(deps)
+        if "clean_main_target" not in prof or "deps_file_threshold" not in prof:
+            return
+        with os.scandir(deps) as it:
+            count = sum(1 for _ in it)
+        threshold = int(prof["deps_file_threshold"])
+        if count <= threshold:
+            return
+        cmd = prof["clean_main_target"]
+        if not self.allow_main_clean:
+            self.report("main-target", f"{count} entries in {deps} > {threshold}; pass --allow-main-clean to run `{cmd}`", deps)
+            return
+        if self.dry_run:
+            self.act("main-target", cmd, prof["repo"], "dry-run")
+            return
+        try:
+            r = fwlib.run(shlex.split(cmd), cwd=prof["repo"], timeout=900)
+            res = "ok" if r.returncode == 0 else f"exit {r.returncode}: {r.stderr.strip()[-500:]}"
+        except subprocess.TimeoutExpired:
+            res = "timeout after 900 s"
+        self.act("main-target", cmd, prof["repo"], res)
+        if res != "ok":
+            self.errors.append(f"main-target: `{cmd}` {res}")
+
+    def prune_objects(self, deps: Path) -> None:
+        """Delete object files no binary reads. macOS dev builds leave each compile's `<unit>.<cgu>.<gen>.rcgu.o` in
+        deps and never delete superseded generations. An executable `<unit>` references only its newest generation
+        (by max mtime; ties all kept); library units are read from their .rlib, so their loose objects are unused.
+        Holds cargo's build-dir lock so no build runs meanwhile."""
+        lock = deps.parent / ".cargo-lock"
+        fd = None
+        try:
+            if lock.exists():
+                fd = os.open(lock, os.O_RDONLY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.report("main-target", "cargo build running; stale object prune skipped", deps)
+                    return
+            gens: dict[str, dict[str, list]] = {}
+            with os.scandir(deps) as it:
+                for e in it:
+                    m = OBJ_RE.match(e.name)
+                    if not m or not e.is_file(follow_symlinks=False):
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                    gens.setdefault(m.group(1), {}).setdefault(m.group(2), []).append((e.path, st.st_mtime, st.st_size))
+            n = size = 0
+            for unit, by_gen in gens.items():
+                exe = deps / unit
+                keep: set[str] = set()
+                if exe.is_file() and not exe.is_symlink() and os.access(exe, os.X_OK):
+                    newest = max(max(f[1] for f in fs) for fs in by_gen.values())
+                    keep = {g for g, fs in by_gen.items() if max(f[1] for f in fs) == newest}
+                for g, fs in by_gen.items():
+                    if g in keep:
+                        continue
+                    for path, _mt, sz in fs:
+                        if not self.dry_run:
+                            try:
+                                os.unlink(path)
+                            except OSError as ex:
+                                self.errors.append(f"main-target: unlink {path}: {ex}")
+                                continue
+                        n += 1
+                        size += sz
+            if n:
+                self.act("main-target", "delete unused *.rcgu.o", str(deps),
+                         f"{'dry-run: ' if self.dry_run else ''}{n} files, {size // 2**20} MB")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _archive_dest(self, name: str) -> Path:
+        arch = self.state / "archive"
+        dest = arch / f"{name}.tar.gz"
+        n = 1
+        while dest.exists():
+            dest = arch / f"{name}-{n}.tar.gz"
+            n += 1
+        return dest
+
+    def archive_and_delete(self, task: str, src: Path, name: str) -> bool:
+        if src.is_symlink() or not src.is_dir():
+            self.errors.append(f"{task}: not a directory, not archived: {src}")
+            return False
+        files = []
+        for root, _dirs, fnames in os.walk(src):
+            for f in fnames:
+                fp = Path(root) / f
+                if fp.suffix in ARCHIVE_SUFFIXES and fp.is_file() and not fp.is_symlink():
+                    files.append(fp)
+        dest = self._archive_dest(name)
+        if self.dry_run:
+            self.act(task, "archive", str(src), f"dry-run: {len(files)} files -> {dest}")
+            return self.rm(task, src)
+        try:
+            check_rmtree(src, self.roots, self.protected)
+        except Refused as e:
+            self.errors.append(f"{task}: refused delete: {e}")
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f".{dest.name}.tmp")
+        try:
+            with tarfile.open(tmp, "w:gz") as tf:
+                for fp in files:
+                    tf.add(fp, arcname=f"{name}/{fp.relative_to(src)}", recursive=False)
+            with tarfile.open(tmp, "r:gz") as tf:
+                members = tf.getnames()
+        except (OSError, tarfile.TarError) as e:
+            tmp.unlink(missing_ok=True)
+            self.errors.append(f"{task}: archive of {src} failed: {e}")
+            return False
+        if len(members) != len(files) or (files and not members):
+            tmp.unlink(missing_ok=True)
+            self.errors.append(f"{task}: archive of {src} lists {len(members)} members, expected {len(files)}")
+            return False
+        os.replace(tmp, dest)
+        self.act(task, "archive", str(src), f"{len(members)} files -> {dest}")
+        return self.rm(task, src)
+
+    def task_run_dirs(self) -> None:
+        task = "run-dirs"
+        runs = self.state / "runs"
+        act_run = None
+        a = fwlib.read_json(self.state / "active.json")
+        if isinstance(a, dict) and a.get("state") != "stopped":
+            act_run = a.get("run_id")
+        if runs.is_dir():
+            for d in sorted(runs.iterdir()):
+                if d.is_symlink() or not d.is_dir() or d.name == act_run:
+                    continue
+                sr = d / "stop-reason"
+                try:
+                    if not sr.is_file() or _age_s(sr) <= 3 * DAY:
+                        continue
+                    self.archive_and_delete(task, d, d.name)
+                except Exception as ex:  # noqa: BLE001
+                    self.errors.append(f"{task}: {d}: {ex!r}")
+        for e in self.active("run-dir"):
+            if not e.get("path"):
+                continue
+            p = Path(e["path"])
+            try:
+                if not p.exists():
+                    self.mark_removed(task, e, "missing")
+                elif _age_s(p) > 14 * DAY and self.archive_and_delete(task, p, p.name):
+                    self.mark_removed(task, e, "archived")
+            except Exception as ex:  # noqa: BLE001
+                self.errors.append(f"{task}: {p}: {ex!r}")
+        arch = self.state / "archive"
+        if arch.is_dir():
+            for f in sorted(arch.glob("*.tar.gz")):
+                if f.is_file() and not f.is_symlink() and _age_s(f) > 180 * DAY:
+                    self.rm(task, f)
+
+    def task_processes(self) -> None:
+        task = "processes"
+        for e in self.active("pid"):
+            try:
+                self._process_one(task, e)
+            except Exception as ex:  # noqa: BLE001
+                self.errors.append(f"{task}: {e.get('pid')}: {ex!r}")
+
+    def _process_one(self, task: str, e: dict) -> None:
+        try:
+            pid = int(e.get("pid"))
+        except (TypeError, ValueError):
+            self.report(task, "registry pid entry has no valid pid; not signalled", e["id"])
+            return
+        target = f"pid {pid}"
+        if pid <= 1 or pid in (os.getpid(), os.getppid()):
+            self.report(task, "refusing to signal this pid", target)
+            return
+        if not proc_alive(pid):
+            self.mark_removed(task, e, "exited")
+            return
+        reg_start = _ws(e.get("pid_start"))
+        if not reg_start:
+            self.report(task, "no registered pid_start; not signalled", target)
+            return
+        if proc_start(pid) != reg_start:
+            self.mark_removed(task, e, "pid-reused")
+            return
+        meta = e["meta"]
+        due = meta.get("owner_done") is True
+        max_age = meta.get("max_age_s")
+        added = fwlib.parse_iso(e.get("ts"))
+        if not due and isinstance(max_age, (int, float)) and added is not None:
+            due = (fwlib.now() - added).total_seconds() > max_age
+        if not due:
+            return
+        if self.dry_run:
+            self.act(task, "terminate", target, "dry-run")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            self.mark_removed(task, e, "exited")
+            return
+        deadline = time.monotonic() + TERM_WAIT_S
+        while time.monotonic() < deadline and proc_alive(pid):
+            time.sleep(0.1)
+        result = "SIGTERM"
+        if proc_alive(pid) and proc_start(pid) == reg_start:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                result = "SIGKILL"
+            except ProcessLookupError:
+                pass
+        self.act(task, "terminate", target, result)
+        self.mark_removed(task, e, "terminated")
+
+    def task_heavy(self) -> None:
+        registered = set()
+        for e in self.active("pid"):
+            try:
+                registered.add(int(e.get("pid")))
+            except (TypeError, ValueError):
+                pass
+        r = fwlib.run(["ps", "-axo", "pid=,pcpu=,etime=,comm="], timeout=30)
+        for p in heavy_processes(r.stdout.splitlines(), registered):
+            self.report("heavy-processes",
+                        f"unregistered process {p['comm']} at {p['pcpu']:g}% CPU for {p['etime_s'] // 60} min; not touched",
+                        f"pid {p['pid']}")
+
+    def task_snapshot(self) -> None:
+        for d in snapshot_dirs():
+            top = repo_root(d) if d.is_dir() else None
+            if top is None:
+                continue
+            spec = os.path.relpath(d, top)
+            git = ["git", "-C", str(top)]
+            if (top / ".git" / "index.lock").exists():
+                self.report("skills-snapshot", "git index is locked; skipped", d)
+                continue
+            r = fwlib.run(git + ["status", "--porcelain", "-z", "--untracked-files=all", "--", spec], timeout=60)
+            if r.returncode != 0:
+                self.errors.append(f"skills-snapshot: git status failed in {d}: {r.stderr.strip()[:200]}")
+                continue
+            paths = porcelain_paths(r.stdout)
+            if not paths:
+                continue
+            newest = min((_age_s(top / p) for p in paths if (top / p).exists()), default=float("inf"))
+            if newest < SNAPSHOT_QUIET_S:
+                self.report("skills-snapshot", f"{len(paths)} uncommitted file(s), last edited {int(newest)}s ago; "
+                            "waiting for edits to settle", d)
+                continue
+            if self.dry_run:
+                self.act("skills-snapshot", "commit", str(d), f"dry-run: {len(paths)} file(s)")
+                continue
+            body = "Edits left uncommitted for over 10 min, committed by fw-housekeep:\n" + \
+                "\n".join(f"- {p}" for p in sorted(paths)[:50])
+            a = fwlib.run(git + ["add", "-A", "--", spec], timeout=60)
+            c = fwlib.run(git + ["commit", "-q", "-m", f"Snapshot uncommitted edits in {spec}", "-m", body,
+                                 "--", spec], timeout=60) if a.returncode == 0 else a
+            if c.returncode != 0:
+                self.errors.append(f"skills-snapshot: commit failed in {d}: {(c.stderr or c.stdout).strip()[:200]}")
+                continue
+            sha = fwlib.run(git + ["rev-parse", "--short", "HEAD"], timeout=30).stdout.strip()
+            self.act("skills-snapshot", "commit", str(d), f"{sha}: {len(paths)} file(s)")
+
+    def task_logs(self) -> None:
+        log = self.state / "watchdog.log"
+        if log.is_file() and not log.is_symlink() and log.stat().st_size > LOG_ROTATE_BYTES:
+            if self.dry_run:
+                self.act("logs", "rotate", str(log), "dry-run")
+            else:
+                for i in range(LOG_KEEP - 1, 0, -1):
+                    src = log.with_name(f"{log.name}.{i}")
+                    if src.exists():
+                        os.replace(src, log.with_name(f"{log.name}.{i + 1}"))
+                os.replace(log, log.with_name(f"{log.name}.1"))
+                self.act("logs", "rotate", str(log), "ok")
+        readings = self.state / "budget-readings.jsonl"
+        if not readings.is_file():
+            return
+        cutoff = fwlib.now() - _dt.timedelta(seconds=READINGS_KEEP_S)
+
+        def fresh(r: dict) -> bool:
+            t = fwlib.parse_iso(r.get("ts"))
+            return t is not None and t >= cutoff
+
+        if self.dry_run:
+            n = sum(1 for r in fwlib.read_jsonl(readings) if not isinstance(r, dict) or not fresh(r))
+            if n:
+                self.act("logs", "prune budget readings", str(readings), f"dry-run: {n} entries")
+            return
+        with fwlib.locked(readings):
+            rows = fwlib.read_jsonl(readings)
+            kept = [r for r in rows if isinstance(r, dict) and fresh(r)]
+            if len(kept) == len(rows):
+                return
+            fd, tmp = tempfile.mkstemp(dir=readings.parent, prefix=f".{readings.name}.")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    for r in kept:
+                        fh.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+                os.replace(tmp, readings)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+        self.act("logs", "prune budget readings", str(readings), f"{len(rows) - len(kept)} entries")
+
+    # -- driver
+
+    def plan(self) -> list[tuple[str, callable]]:
+        prof = self.profile is not None
+        full = self.mode == "full"
+        tasks = [("disk", self.task_disk)]
+        if full and prof:
+            tasks += [("worktrees", self.task_worktrees), ("foreign-worktrees", self.task_foreign_worktrees),
+                      ("build-dirs", self.task_build_dirs), ("main-target", self.task_main_target)]
+        if full:
+            tasks.append(("run-dirs", self.task_run_dirs))
+        tasks += [("processes", self.task_processes), ("heavy-processes", self.task_heavy), ("logs", self.task_logs),
+                  ("skills-snapshot", self.task_snapshot)]
+        return tasks
+
+    def run(self) -> dict:
+        for name, fn in self.plan():
+            try:
+                fn()
+            except Exception as ex:  # noqa: BLE001
+                self.errors.append(f"{name}: {ex!r}")
+        return {"mode": self.mode, "dry_run": self.dry_run, "actions": self.actions, "reports": self.reports,
+                "disk_free_gb": self.disk_free_gb, "errors": self.errors}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = Parser(prog="fw-housekeep", description=__doc__)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--quick", action="store_true")
+    g.add_argument("--full", action="store_true")
+    ap.add_argument("--profile")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-main-clean", action="store_true")
+    ap.add_argument("--json", action="store_true", help="JSON output (the default)")
+    args = ap.parse_args(argv)
+    profile = None
+    if args.profile:
+        try:
+            profile = fwlib.load_profile(args.profile)
+        except (OSError, ValueError, KeyError) as e:
+            ap.error(f"cannot load profile {args.profile!r}: {e}")
+    hk = Housekeeper("full" if args.full else "quick", profile, args.dry_run, args.allow_main_clean)
+    fwlib.emit(hk.run())
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"fw-housekeep: internal error: {e!r}", file=sys.stderr)
+        sys.exit(2)

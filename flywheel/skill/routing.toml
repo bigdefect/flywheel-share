@@ -1,0 +1,22 @@
+# Defaults read by bin/fw-route. Retro edits data here, not code.
+split_threshold = 500
+audit_one_in = 5
+experiment_one_in = 6
+experiments_max_per_run = 3
+planner_high_kinds = ["parity", "algorithmic", "architecture"]
+
+[models]
+planner = "opus"
+implementer = "sonnet"
+implementer_high_risk = "opus"
+reviewer = "opus"
+verify = "opus"
+helper = "sonnet"
+
+[efforts]
+planner = "medium"
+planner_high = "high"
+implementer = "medium"
+reviewer = "medium"
+verify = "medium"
+helper = "medium"
